@@ -339,11 +339,11 @@ def plot_dihedrals(
     Traj_phi_chains = split_into_chains(Traj_phi, line_locations)
     Traj_psi_chains = split_into_chains(Traj_psi, line_locations)
     fig2, axs2 = plt.subplots(1, 2, figsize=(12, 4))
-    utils.plot_1d_dihedral(axs2[0], [AT_phi], ['Reference'], bins=60, degrees=True)
-    utils.plot_1d_dihedral_mean_std(axs2[0], [Traj_phi_chains], ['Simulation'], bins=60, degrees=True)
+    utils.plot_1d_dihedral(axs2[0], [AT_phi], ['Reference'], bins=60, degrees=True, color='blue')
+    utils.plot_1d_dihedral_mean_std(axs2[0], [Traj_phi_chains], ['Simulation'], bins=60, degrees=True, color='orange')
     axs2[0].set_title('Dihedral angle phi')
-    utils.plot_1d_dihedral(axs2[1], [AT_psi], ['Reference'], bins=60, degrees=True)
-    utils.plot_1d_dihedral_mean_std(axs2[1], [Traj_psi_chains], ['Simulation'], bins=60, degrees=True)
+    utils.plot_1d_dihedral(axs2[1], [AT_psi], ['Reference'], bins=60, degrees=True, color='blue')
+    utils.plot_1d_dihedral_mean_std(axs2[1], [Traj_psi_chains], ['Simulation'], bins=60, degrees=True, color='orange')
     axs2[1].set_title('Dihedral angle psi')
     plt.tight_layout()
     fig2.savefig(os.path.join(outpath, 'Dihedrals_mean_std.png'), dpi=300)
@@ -415,9 +415,12 @@ def plot_energy_and_kT(
     mapping = [
         ('Epot', aux.get('epot'), utils.plot_energy),
         ('kT', aux.get('kT'), utils.plot_kT),
-        ('Etotal', aux.get('etot'), utils.plot_kT),
+        ('Etotal', aux.get('etot'), utils.plot_energy),
         ('Temperature', aux.get('kT'), utils.plot_T),
     ]
+    if 'eprior' in aux:
+        mapping.append(('Eprior', aux.get('eprior'), utils.plot_energy))
+    
     for label, data, plot_fn in mapping:
         if data is None:
             continue

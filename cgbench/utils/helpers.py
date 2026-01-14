@@ -188,73 +188,6 @@ def save_xyz_frames_parallel(
             f.write(frame_str)
 
 
-def compute_angle(coords: jnp.ndarray, idcs: list[int]) -> jnp.ndarray:
-    """
-    Compute bond angles for every frame of a trajectory.
-
-    Parameters
-    ----------
-    coords : jnp.ndarray
-        Trajectory coordinates with shape (n_frames, n_atoms, 3)
-    idcs : list[int]
-        Three atom indices [i, j, k] where j is the central atom
-
-    Returns
-    -------
-    jnp.ndarray
-        Array of bond angles in radians with shape (n_frames,)
-    """
-    i0, i1, i2 = idcs
-
-    @jax.jit
-    def angle_of_frame(frame: jnp.ndarray) -> jnp.ndarray:
-        p0 = frame[i0]
-        p1 = frame[i1]
-        p2 = frame[i2]
-        return calculate_angle(p0, p1, p2)
-
-    # Vectorize over frames
-    return jax.vmap(angle_of_frame)(coords)
-
-
-def calculate_angle(p0: jnp.ndarray, p1: jnp.ndarray, p2: jnp.ndarray) -> jnp.ndarray:
-    """
-    Calculate the bond angle between three points p0-p1-p2.
-
-    Parameters
-    ----------
-    p0 : jnp.ndarray
-        Position vector of the first atom with shape (3,)
-    p1 : jnp.ndarray
-        Position vector of the central atom with shape (3,)
-    p2 : jnp.ndarray
-        Position vector of the third atom with shape (3,)
-
-    Returns
-    -------
-    jnp.ndarray
-        Bond angle in radians (scalar)
-    """
-    # Vectors from central atom to the other two atoms
-    v1 = p0 - p1  # Vector from p1 to p0
-    v2 = p2 - p1  # Vector from p1 to p2
-
-    # Normalize vectors
-    v1_norm = jnp.linalg.norm(v1)
-    v2_norm = jnp.linalg.norm(v2)
-
-    # Compute cosine of angle using dot product
-    cos_angle = jnp.dot(v1, v2) / (v1_norm * v2_norm)
-
-    # Clamp to avoid numerical issues with arccos
-    cos_angle = jnp.clip(cos_angle, -1.0, 1.0)
-
-    # Calculate angle in radians
-    angle = jnp.arccos(cos_angle)
-
-    return angle
-
-
 def init_dihedral_fn(displacement_fn: Callable, idcs: list[int]) -> Callable:
     """
     Initialize a function to compute dihedral angles from trajectory positions.
@@ -394,6 +327,7 @@ def plot_1d_dihedral(
     degrees: bool = True,
     xlabel: str = "$\phi$ in deg",
     ylabel: bool = True,
+    color = 'blue'
 ) -> Axes:
     """
     Plot 1D histogram splines for dihedral angles.
@@ -420,20 +354,6 @@ def plot_1d_dihedral(
     Axes
         The modified matplotlib axes object
     """
-    color = [
-        "#368274",
-        "#0C7CBA",
-        "#C92D39",
-        "#FFB347",
-        "#7851A9",
-        "#66CC99",
-        "#FF6B6B",
-        "#4A90E2",
-        "#50514F",
-        "#F4A261",
-    ]
-    line = ["-", "-", "-"]
-
     n_models = len(angles)
     for i in range(n_models):
         if degrees:
@@ -453,9 +373,9 @@ def plot_1d_dihedral(
         ax.plot(
             bin_center[:-1],
             hist,
-            label=labels[i],  # , color=color[i],
-            # linestyle=line[i],
+            label=labels[i],
             linewidth=2.0,
+            color=color,
         )
 
     ax.set_xlabel(xlabel)
@@ -474,6 +394,7 @@ def plot_1d_dihedral_mean_std(
     degrees: bool = True,
     xlabel: str = "$\phi$ in deg",
     ylabel: bool = True,
+    color = 'blue'
 ) -> Axes:
     """
     Plot 1D histogram with mean and standard deviation as shaded area for each dihedral angle set.
@@ -500,17 +421,6 @@ def plot_1d_dihedral_mean_std(
     Axes
         The modified matplotlib axes object
     """
-    color = [
-        "#0C7CBA",
-        "#C92D39",
-        "#FFB347",
-        "#7851A9",
-        "#66CC99",
-        "#FF6B6B",
-        "#4A90E2",
-        "#50514F",
-        "#F4A261",
-    ]
     n_models = len(angles)
     for i in range(n_models):
         data = onp.array(angles[i])
@@ -542,12 +452,12 @@ def plot_1d_dihedral_mean_std(
         width = x_bins[1] - x_bins[0]
         bin_center = x_bins[:-1] + width / 2
 
-        ax.plot(bin_center, hist_mean, label=labels[i], color=color[i], linewidth=2.0)
+        ax.plot(bin_center, hist_mean, label=labels[i], color=color, linewidth=2.0)
         ax.fill_between(
             bin_center,
             hist_mean - hist_std,
             hist_mean + hist_std,
-            color=color[i],
+            color=color,
             alpha=0.2,
         )
 

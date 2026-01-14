@@ -9,6 +9,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--device", type=str, help="GPU or MIG UUID")
 parser.add_argument("--cgmap", type=str, help="CG mapping to use", required=True)
 parser.add_argument("--mol", type=str, help="Molecule to use", required=True)
+parser.add_argument("--prior", action="store_true", help="Use bond priors")
 parser.add_argument(
     "--rcut", type=float, help="Cutoff radius for neighbor list", default=0.5
 )
@@ -19,7 +20,7 @@ args = parser.parse_args()
 
 if args.device:
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.97"
 
 import numpy as onp
 import optax
@@ -31,11 +32,13 @@ from chemtrain.trainers import trainers
 import json
 from jax import numpy as jnp, random, tree_util
 from cgbench.core import dataset
-from cgbench.core.config import DEFAULT_MACE_CONFIG as MACE_CONFIG, DEFAULT_TRAIN_CONFIG as TRAIN_CONFIG
+from cgbench.core.config import DEFAULT_MACE_CONFIG as MACE_CONFIG, DEFAULT_TRAIN_CONFIG as TRAIN_CONFIG, BOND_SPRING_CONSTANTS
+from jax_md import space, energy, partition
 
 MACE_CONFIG["r_cutoff"] = args.rcut
 MACE_CONFIG["mol"] = args.mol 
 MACE_CONFIG["CG_map"] = args.cgmap
+MACE_CONFIG["use_bond_priors"] = args.prior
 MACE_CONFIG["type"] = "CG" if MACE_CONFIG["CG_map"] != "AT" else "AT"
 
 # -------------------------
@@ -88,7 +91,7 @@ elif MACE_CONFIG["type"] == "CG":
 else:
     raise ValueError("Invalid simulation type. Use 'AT' or 'CG'.")
 
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}_corr={MACE_CONFIG['correlation']}_seed={MACE_CONFIG['PRNGKey_seed']}"
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}_corr={MACE_CONFIG['correlation']}_seed={MACE_CONFIG['PRNGKey_seed']}_prior={MACE_CONFIG['use_bond_priors']}"
 os.makedirs(output_dir, exist_ok=True)
 
 # -------------------------
@@ -133,11 +136,20 @@ init_fn, gnn_energy_fn = mace.mace_neighborlist_pp(
     positive_species=True,
 )
 
-
+# Hexane, two-site
+Bond_pairs = [(0,1)]
+Bonds_all = []
+nmol = 100
+sites_per_mol = 2 
+for m in range(nmol):
+    offset = m * sites_per_mol
+    Bonds_all.extend([(a+offset, b+offset) for (a,b) in Bond_pairs])
+    
 def energy_fn_template(energy_params):
     def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
-        assert "species" in dynamic_kwargs.keys(), "species not in dynamic_kwargs"
-
+        dynamic_kwargs.setdefault("species", species)
+        dynamic_kwargs.setdefault("box", box)
+        
         if "mask" not in dynamic_kwargs:
             print(f"Add defaul all-positive mask.")
             dynamic_kwargs["mask"] = jnp.ones(pos.shape[0], dtype=jnp.bool_)
@@ -146,8 +158,29 @@ def energy_fn_template(energy_params):
             print(f"Found box in energy kwargs")
 
         return gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
-
-    return energy_fn
+    
+    if args.prior:
+        key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
+        assert key in BOND_SPRING_CONSTANTS
+        prior_constants = BOND_SPRING_CONSTANTS[key]
+                
+        harmonic_energy_fn = energy.simple_spring_bond(
+            displacement_fn, 
+            bond=jnp.asarray(Bonds_all),
+            length=jnp.exp(prior_constants['log_b0']), # b0
+            epsilon=jnp.exp(prior_constants['log_kb']), # kb
+            alpha=2.0 # standard harmonic
+        )
+        
+        def total_energy_fn(pos, neighbor, **dynamic_kwargs):
+            gnn_e = energy_fn(pos, neighbor, **dynamic_kwargs)
+            harmonic_e = harmonic_energy_fn(pos)
+            return gnn_e + harmonic_e
+            
+        return total_energy_fn
+        
+    else:
+        return energy_fn
 
 
 key = random.PRNGKey(MACE_CONFIG["PRNGKey_seed"])

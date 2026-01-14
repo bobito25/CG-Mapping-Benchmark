@@ -32,10 +32,10 @@ from chemtrain import quantity, util
 from chemutils.models import mace
 from jax import random
 from chemtrain.ensemble import sampling
-from jax_md import partition, space, simulate
+from jax_md import partition, space, simulate, energy
 from jax_md_mod import custom_quantity
 from cgbench.core import dataset
-from cgbench.core.config import DEFAULT_SIM_CONFIG as SIM_CONFIG
+from cgbench.core.config import DEFAULT_SIM_CONFIG as SIM_CONFIG, BOND_SPRING_CONSTANTS
 
 # -------------------------
 # Configuration handling
@@ -174,17 +174,74 @@ init_fn, gnn_energy_fn = mace.mace_neighborlist_pp(
 )
 
 
+# def energy_fn_template(energy_params):
+#     def energy_fn(pos, neighbor, **dynamic_kwargs):
+#         dynamic_kwargs.setdefault("species", species)
+
+#         if "box" not in dynamic_kwargs.keys():
+#             print("Use default box")
+
+#         gnn_energy = gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
+#         return gnn_energy
+
+#     return energy_fn
+if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
+    print("Using bond priors in simulation energy function.")
+
+
+Bond_pairs = [(0,1)]
+Bonds_all = []
+nmol = 100
+sites_per_mol = 2 
+for m in range(nmol):
+    offset = m * sites_per_mol
+    Bonds_all.extend([(a+offset, b+offset) for (a,b) in Bond_pairs])
+    
+key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
+assert key in BOND_SPRING_CONSTANTS
+prior_constants = BOND_SPRING_CONSTANTS[key]
+
+harmonic_energy_fn = energy.simple_spring_bond(
+            displacement_fn, 
+            bond=jnp.asarray(Bonds_all),
+            length=jnp.exp(prior_constants['log_b0']), # b0
+            epsilon=jnp.exp(prior_constants['log_kb']), # kb
+            alpha=2.0 # standard harmonic
+        )
+
+def prior_energy_wrapper(energy_fn_template):
+    def prior_energy(state, neighbor, energy_params, **kwargs):
+        energy_fn = energy_fn_template(energy_params)
+        harmonic_energy = energy_fn(state.position)
+        return harmonic_energy
+    return prior_energy
+
 def energy_fn_template(energy_params):
-    def energy_fn(pos, neighbor, **dynamic_kwargs):
+    def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
         dynamic_kwargs.setdefault("species", species)
-
-        if "box" not in dynamic_kwargs.keys():
-            print("Use default box")
-
-        gnn_energy = gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
-        return gnn_energy
-
-    return energy_fn
+        dynamic_kwargs.setdefault("box", box)
+        
+        return gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
+    
+    if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
+        # Hexane, two-site
+        harmonic_energy_fn = energy.simple_spring_bond(
+            displacement_fn, 
+            bond=jnp.asarray(Bonds_all),
+            length=jnp.exp(prior_constants['log_b0']), # b0
+            epsilon=jnp.exp(prior_constants['log_kb']), # kb
+            alpha=2.0 # standard harmonic
+        )
+        
+        def total_energy_fn(pos, neighbor, **dynamic_kwargs):
+            gnn_e = energy_fn(pos, neighbor, **dynamic_kwargs)
+            harmonic_e = harmonic_energy_fn(pos)
+            return gnn_e + harmonic_e
+            
+        return total_energy_fn
+        
+    else:
+        return energy_fn
 
 if args.verbose:
     print(f"Max neighbors: {max_neighbors}, max edges: {max_edges}")
@@ -289,13 +346,14 @@ def init_simulator(
         t_equilib=t_eq,
         print_every=config["print_every"],
     )
-
+    
     # Setup quantities to record
     quantities = {
         "kT": custom_quantity.temperature,
         "epot": custom_quantity.energy_wrapper(lambda _: energy_fn),
         "force": custom_quantity.force_wrapper(lambda _: energy_fn),
         "etot": custom_quantity.total_energy_wrapper(lambda _: energy_fn),
+        "eprior": prior_energy_wrapper(lambda _: harmonic_energy_fn),
     }
 
     # Initialize trajectory generator
