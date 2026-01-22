@@ -21,3 +21,5 @@ traj.lammpstrj
 *.trr
 MLP_train*/
 setup.py
+checkpoints/
+tests/

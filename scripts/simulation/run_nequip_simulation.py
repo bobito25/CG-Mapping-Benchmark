@@ -307,7 +307,7 @@ def init_simulator(
 
 
 def visualise(traj_path, dataset):
-    from cgbench.utils import visualization as visualise_traj
+    from cgbench.plotting import molecules as visualise_traj
     vis_fn_map = {
         'ala2': visualise_traj.vis_ala2,
         'hexane': visualise_traj.vis_hexane,
