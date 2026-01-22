@@ -136,15 +136,6 @@ init_fn, gnn_energy_fn = mace.mace_neighborlist_pp(
     positive_species=True,
 )
 
-# Hexane, two-site
-Bond_pairs = [(0,1)]
-Bonds_all = []
-nmol = 100
-sites_per_mol = 2 
-for m in range(nmol):
-    offset = m * sites_per_mol
-    Bonds_all.extend([(a+offset, b+offset) for (a,b) in Bond_pairs])
-    
 def energy_fn_template(energy_params):
     def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
         dynamic_kwargs.setdefault("species", species)
@@ -166,7 +157,7 @@ def energy_fn_template(energy_params):
                 
         harmonic_energy_fn = energy.simple_spring_bond(
             displacement_fn, 
-            bond=jnp.asarray(Bonds_all),
+            bond=jnp.asarray(prior_constants['indices']),
             length=jnp.exp(prior_constants['log_b0']), # b0
             epsilon=jnp.exp(prior_constants['log_kb']), # kb
             alpha=2.0 # standard harmonic
@@ -251,7 +242,7 @@ with open(f"{output_dir}/config.json", "w") as f:
 with open(f"{output_dir}/train_config.json", "w") as f:
     json.dump(TRAIN_CONFIG, f, indent=4)
 
-from cgbench.utils.helpers import plot_predictions, plot_convergence
+from cgbench.plotting.training import plot_predictions, plot_convergence
 
 # Plot training convergence
 plot_convergence(trainer_fm, output_dir)

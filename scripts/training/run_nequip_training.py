@@ -215,7 +215,7 @@ with open(f"{output_dir}/config.json", "w") as f:
 with open(f"{output_dir}/train_config.json", "w") as f:
     json.dump(TRAIN_CONFIG, f, indent=4)
 
-from cgbench.utils.helpers import plot_predictions, plot_convergence
+from cgbench.plotting.training import plot_predictions, plot_convergence
 
 # Plot training convergence
 plot_convergence(trainer_fm, output_dir)

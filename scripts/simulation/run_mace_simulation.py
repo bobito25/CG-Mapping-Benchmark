@@ -173,29 +173,9 @@ init_fn, gnn_energy_fn = mace.mace_neighborlist_pp(
     positive_species=True,
 )
 
-
-# def energy_fn_template(energy_params):
-#     def energy_fn(pos, neighbor, **dynamic_kwargs):
-#         dynamic_kwargs.setdefault("species", species)
-
-#         if "box" not in dynamic_kwargs.keys():
-#             print("Use default box")
-
-#         gnn_energy = gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
-#         return gnn_energy
-
-#     return energy_fn
 if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
     print("Using bond priors in simulation energy function.")
 
-
-Bond_pairs = [(0,1)]
-Bonds_all = []
-nmol = 100
-sites_per_mol = 2 
-for m in range(nmol):
-    offset = m * sites_per_mol
-    Bonds_all.extend([(a+offset, b+offset) for (a,b) in Bond_pairs])
     
 key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
 assert key in BOND_SPRING_CONSTANTS
@@ -203,7 +183,7 @@ prior_constants = BOND_SPRING_CONSTANTS[key]
 
 harmonic_energy_fn = energy.simple_spring_bond(
             displacement_fn, 
-            bond=jnp.asarray(Bonds_all),
+            bond=jnp.asarray(prior_constants['indices']),
             length=jnp.exp(prior_constants['log_b0']), # b0
             epsilon=jnp.exp(prior_constants['log_kb']), # kb
             alpha=2.0 # standard harmonic
@@ -227,7 +207,7 @@ def energy_fn_template(energy_params):
         # Hexane, two-site
         harmonic_energy_fn = energy.simple_spring_bond(
             displacement_fn, 
-            bond=jnp.asarray(Bonds_all),
+            bond=jnp.asarray(prior_constants['indices']),
             length=jnp.exp(prior_constants['log_b0']), # b0
             epsilon=jnp.exp(prior_constants['log_kb']), # kb
             alpha=2.0 # standard harmonic
@@ -370,7 +350,7 @@ def init_simulator(
 
 
 def visualise(traj_path, dataset):
-    from cgbench.utils import visualization as visualise_traj
+    from cgbench.plotting import molecules as visualise_traj
     vis_fn_map = {
         'ala2': visualise_traj.vis_ala2,
         'hexane': visualise_traj.vis_hexane,

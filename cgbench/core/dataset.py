@@ -3,7 +3,7 @@ import copy
 from jax_md import space
 from jax import numpy as jnp
 import numpy as np
-from ..utils import helpers as utils
+from ..utils import io 
 from .mapping import Ala2_Map, Hexane_Map, Ala15_Map, Pro2_Map, Thr2_Map, Gly2_Map, map_dataset
 from .config import Dataset_paths, SEED
 
@@ -59,7 +59,7 @@ class BaseDataset:
         dataset_frac = {}
         self.splits = dataset_.keys()
         for split in self.splits:
-            out = utils.scale_dataset(
+            out = io.scale_dataset(
                 dataset_[split], scale_R=1, scale_U=1, fractional=True
             )
             dataset_frac[split] = out
@@ -131,7 +131,7 @@ class BaseDataset:
         # Create fractional coordinate versions
         cg_dataset_frac = {}
         for split in self.splits:
-            out = utils.scale_dataset(
+            out = io.scale_dataset(
                 cg_dataset[split], scale_R=1, scale_U=1, fractional=True
             )
             cg_dataset_frac[split] = out

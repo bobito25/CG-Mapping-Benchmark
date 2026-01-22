@@ -11,12 +11,23 @@ Dataset_paths = {
 def _get_available_datasets():
     return list(Dataset_paths.keys())
 
+# Not great, but leave this here for now
+Bond_pairs = [(0,1)]
+Bonds_all = []
+nmol = 100
+sites_per_mol = 2 
+for m in range(nmol):
+    offset = m * sites_per_mol
+    Bonds_all.extend([(a+offset, b+offset) for (a,b) in Bond_pairs])
+
 BOND_SPRING_CONSTANTS = { # Derived from mapped reference simulation
     'mol=hexane_map=two-site': {
         'log_kb': 8.701623916625977,
-        'log_b0': -0.9802775382995605
+        'log_b0': -0.9802775382995605,
+        'indices': Bonds_all,
     }
 }
+
 
 # Global configurations
 SEED = 22
@@ -26,7 +37,7 @@ DEFAULT_MACE_CONFIG = {
     "readout_mlp_irreps": "16x0e",
     "output_irreps": "1x0e",
     "max_ell": 3,
-    "num_interactions": 3,
+    "num_interactions": 2,
     "correlation": 2,
     "n_radial_basis": 8,
     "train_ratio": 0.9,  
@@ -56,7 +67,7 @@ DEFAULT_SIM_CONFIG = {
     "ensemble": "NVT", # NVT or NVE
     "t_eq": 0,  # Equlibration time in ps
     "t_total": 1000,  # Total simulation time in ps (- t_eq)
-    "n_chains": 50, # Number of simulations (parallel)
+    "n_chains": 10, # Number of simulations (parallel)
     "kT": 300.0 * quantity.kb,  # Temperature in energy units
     "T": 300.0,
     "PRNGKey_seed": SEED,
