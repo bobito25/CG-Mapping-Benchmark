@@ -1,4 +1,4 @@
-> **_NOTE:_** Initial code release. More extensive documentation will be added soon.
+> **_NOTE:_** This codebase is contiuously updated. The state for the JCIM publication "Mapping Still Matters: Coarse-Graining with Machine Learning Potentials" can be found in the branch `JCIM-acs.jcim.5c03035` (latest commit `08d2fa0`).
 
 # CG Mapping Benchmark 
 Testing different coarse-graining (CG) mappings with classical and machine learning potentials (MLPs).
