@@ -2,5 +2,6 @@ jax
 jax-md
 numpy
 chemtrain
-../biased-force-matching/chemutils
 orbax-checkpoint<=0.11.32  # needed for windows
+../biased-force-matching/chemutils
+../chemtrain/jax_md_mod
