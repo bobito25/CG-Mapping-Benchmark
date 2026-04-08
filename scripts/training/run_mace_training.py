@@ -24,7 +24,7 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.97"
 
 import numpy as onp
 import optax
-from chemutils.models import mace
+from external.models import mace
 from chemtrain import trainers
 from chemtrain.data import preprocessing
 from jax_md import partition, space
