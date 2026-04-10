@@ -10,6 +10,7 @@ cuequivariance-jax==0.7.0
 cuequivariance-ops-cu12==0.7.0
 cuequivariance-ops-jax-cu12==0.7.0
 jax[cuda12]==0.7.0 #--force-reinstall
+seaborn
 #orbax-checkpoint<=0.11.32  # needed for windows
 #../biased-force-matching/chemutils
 #../chemtrain/jax_md_mod
