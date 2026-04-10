@@ -29,8 +29,8 @@ import time
 
 from chemtrain.data import preprocessing
 from chemtrain import quantity, util
-from chemutils.models import allegro, nequip
-from chemutils.models import mace
+from external.models import allegro, nequip
+from external.models import mace
 from jax import random
 from chemtrain.ensemble import sampling
 from jax_md import partition, space, simulate

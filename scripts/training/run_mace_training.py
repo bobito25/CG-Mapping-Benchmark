@@ -16,6 +16,11 @@ parser.add_argument(
 parser.add_argument(
     "--verbose", action="store_true", help="Enable verbose output", default=False
 )
+parser.add_argument(
+    "--use-so3",
+    action="store_true",
+    help="Use SO(3) equivariance in MACE instead of O(3) (disables cueq)",
+)
 args = parser.parse_args()
 
 if args.device:
@@ -24,13 +29,12 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.97"
 
 import numpy as onp
 import optax
-from chemutils.models import mace
 from chemtrain import trainers
 from chemtrain.data import preprocessing
-from jax_md import partition, space
-from chemtrain.trainers import trainers
+from chemtrain.compose import mace_jax as mace_jax_compose
 import json
-from jax import numpy as jnp, random, tree_util
+from jax import numpy as jnp, tree_util
+from mace_jax.modules.wrapper_ops import CuEquivarianceConfig
 from cgbench.core import dataset
 from cgbench.core.config import DEFAULT_MACE_CONFIG as MACE_CONFIG, DEFAULT_TRAIN_CONFIG as TRAIN_CONFIG, BOND_SPRING_CONSTANTS
 from jax_md import space, energy, partition
@@ -108,7 +112,7 @@ nbrs_init, (max_neighbors, max_edges, avg_num_neighbors) = (
         r_cutoff=MACE_CONFIG["r_cutoff"],
         mask_key="mask",
         box_key="box",
-        format=partition.Sparse,
+        format=partition.Dense,
         batch_size=100,
     )
 )
@@ -118,37 +122,65 @@ if args.verbose:
         f"Max neighbors: {max_neighbors}, Max edges: {max_edges}, Avg neighbors: {avg_num_neighbors}"
     )
 
-init_fn, gnn_energy_fn = mace.mace_neighborlist_pp(
-    displacement_fn,
-    MACE_CONFIG["r_cutoff"],
-    n_species,
-    max_edges=max_edges,
+mace_cfg = {
+    "r_cutoff": MACE_CONFIG["r_cutoff"],
+    "hidden_irreps": MACE_CONFIG["hidden_irreps"],
+    "MLP_irreps": MACE_CONFIG["readout_mlp_irreps"],
+    "num_interactions": MACE_CONFIG["num_interactions"],
+    "max_ell": MACE_CONFIG["max_ell"],
+    "correlation": MACE_CONFIG["correlation"],
+    "n_radial_basis": MACE_CONFIG["n_radial_basis"],
+    "output_irreps": MACE_CONFIG["output_irreps"],
+    "use_so3": bool(args.use_so3),
+}
+
+cueq_config = CuEquivarianceConfig(
+    enabled=True,
+    layout=("mul_ir"),
+    group=("O3"),
+    optimize_all=True,
+    conv_fusion=True,
+)
+if args.use_so3:
+    print("[NOTE] Using SO(3) equivariance (no CuEquivariance support)")
+    cueq_config = None
+
+template_vars, gnn_energy_fn, model_config = mace_jax_compose.mace_jax_neighborlist(
+    displacement=displacement_fn,
+    r_cutoff=MACE_CONFIG["r_cutoff"],
+    n_species=n_species,
     per_particle=False,
     avg_num_neighbors=avg_num_neighbors,
     mode="energy",
-    hidden_irreps=MACE_CONFIG["hidden_irreps"],
-    max_ell=MACE_CONFIG["max_ell"],
-    num_interactions=MACE_CONFIG["num_interactions"],
-    correlation=MACE_CONFIG["correlation"],
-    readout_mlp_irreps=MACE_CONFIG["readout_mlp_irreps"],
-    output_irreps=MACE_CONFIG["output_irreps"],
-    n_radial_basis=MACE_CONFIG["n_radial_basis"],
-    positive_species=True,
+    use_custom_batch_fn=True,
+    mace_config=mace_cfg,
+    cueq_config=cueq_config,
 )
 
+init_params = template_vars["params"]
+variables = template_vars
+species_init = jnp.asarray(dataset["training"]["species"][0])
+
 def energy_fn_template(energy_params):
+    vars = {**variables}
+    vars["params"] = energy_params
+
     def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
-        dynamic_kwargs.setdefault("species", species)
+        del mode
+        dynamic_kwargs.setdefault("species", species_init)
         dynamic_kwargs.setdefault("box", box)
-        
-        if "mask" not in dynamic_kwargs:
-            print(f"Add defaul all-positive mask.")
-            dynamic_kwargs["mask"] = jnp.ones(pos.shape[0], dtype=jnp.bool_)
+        mask = dynamic_kwargs.pop("mask", jnp.ones(pos.shape[0], dtype=jnp.bool_))
 
-        if "box" in dynamic_kwargs:
-            print(f"Found box in energy kwargs")
+        pots = gnn_energy_fn(vars, pos, neighbor, **dynamic_kwargs)
+        if pots.ndim == 2 and pots.shape[-1] == 1:
+            pots = pots.squeeze(-1)
 
-        return gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
+        atomic_numbers = jnp.asarray(model_config["atomic_numbers"], dtype=jnp.int32)
+        atomic_energies = jnp.asarray(model_config["atomic_energies"], dtype=jnp.float32)
+        mapped_species = jnp.argmax(dynamic_kwargs["species"][:, None] == atomic_numbers[None, :], axis=-1)
+
+        pots = (pots - atomic_energies[mapped_species]) * mask
+        return jnp.sum(pots)
     
     if args.prior:
         key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
@@ -173,12 +205,8 @@ def energy_fn_template(energy_params):
     else:
         return energy_fn
 
-
-key = random.PRNGKey(MACE_CONFIG["PRNGKey_seed"])
 r_init = jnp.asarray(dataset["training"]["R"][0])
-species_init = jnp.asarray(dataset["training"]["species"][0])
 mask_init = jnp.asarray(dataset["training"]["mask"][0])
-init_params = init_fn(key, r_init, nbrs_init, species=species_init, mask=mask_init)
 nbrs_init = nbrs_init.update(r_init, mask=mask_init)
 
 
