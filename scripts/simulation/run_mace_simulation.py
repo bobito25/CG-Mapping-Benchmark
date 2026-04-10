@@ -199,7 +199,7 @@ if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
 
     
 key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
-assert key in BOND_SPRING_CONSTANTS
+#assert key in BOND_SPRING_CONSTANTS
 prior_constants = BOND_SPRING_CONSTANTS[key]
 
 harmonic_energy_fn = energy.simple_spring_bond(
