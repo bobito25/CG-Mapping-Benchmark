@@ -1,7 +1,15 @@
 jax
 jax-md
 numpy
-chemtrain
-orbax-checkpoint<=0.11.32  # needed for windows
-../biased-force-matching/chemutils
-../chemtrain/jax_md_mod
+../chemtrain
+../mace-jax
+h5py
+mace-torch
+cuequivariance==0.7.0
+cuequivariance-jax==0.7.0
+cuequivariance-ops-cu12==0.7.0
+cuequivariance-ops-jax-cu12==0.7.0
+jax[cuda12]==0.7.0 #--force-reinstall
+#orbax-checkpoint<=0.11.32  # needed for windows
+#../biased-force-matching/chemutils
+#../chemtrain/jax_md_mod
