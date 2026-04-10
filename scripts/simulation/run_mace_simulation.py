@@ -29,7 +29,8 @@ import time
 
 from chemtrain.data import preprocessing
 from chemtrain import quantity, util
-from external.models import mace
+from chemtrain.compose import mace_jax as mace_jax_compose
+from mace_jax.modules.wrapper_ops import CuEquivarianceConfig
 from jax import random
 from chemtrain.ensemble import sampling
 from jax_md import partition, space, simulate, energy
@@ -155,23 +156,43 @@ nbrs_init, (max_neighbors, max_edges, avg_num_neighbors) = (
 # -------------------------
 # Model initialization
 # -------------------------
-init_fn, gnn_energy_fn = mace.mace_neighborlist_pp(
-    displacement_fn,
-    r_cutoff,
-    n_species,
-    max_edges=max_edges,
+mace_cfg = {
+    "r_cutoff": MACE_CONFIG["r_cutoff"],
+    "hidden_irreps": MACE_CONFIG["hidden_irreps"],
+    "MLP_irreps": MACE_CONFIG["readout_mlp_irreps"],
+    "num_interactions": MACE_CONFIG["num_interactions"],
+    "max_ell": MACE_CONFIG["max_ell"],
+    "correlation": MACE_CONFIG["correlation"],
+    "n_radial_basis": MACE_CONFIG["n_radial_basis"],
+    "output_irreps": MACE_CONFIG["output_irreps"],
+    "use_so3": MACE_CONFIG.get("use_so3", False),
+}
+
+cueq_config = CuEquivarianceConfig(
+    enabled=True,
+    layout=("mul_ir"),
+    group=("O3"),
+    optimize_all=True,
+    conv_fusion=True,
+)
+if MACE_CONFIG.get("use_so3", False):
+    print("[NOTE] Using SO(3) equivariance (no CuEquivariance support)")
+    cueq_config = None
+
+template_vars, gnn_energy_fn, model_config = mace_jax_compose.mace_jax_neighborlist(
+    displacement=displacement_fn,
+    r_cutoff=MACE_CONFIG["r_cutoff"],
+    n_species=n_species,
     per_particle=False,
     avg_num_neighbors=avg_num_neighbors,
     mode="energy",
-    hidden_irreps=MACE_CONFIG["hidden_irreps"],
-    max_ell=MACE_CONFIG["max_ell"],
-    num_interactions=MACE_CONFIG["num_interactions"],
-    correlation=MACE_CONFIG["correlation"],
-    readout_mlp_irreps=MACE_CONFIG["readout_mlp_irreps"],
-    output_irreps=MACE_CONFIG["output_irreps"],
-    n_radial_basis=MACE_CONFIG["n_radial_basis"],
-    positive_species=True,
+    use_custom_batch_fn=False,
+    mace_config=mace_cfg,
+    cueq_config=cueq_config,
 )
+
+variables = template_vars
+species_init = jnp.asarray(species)
 
 if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
     print("Using bond priors in simulation energy function.")
@@ -197,11 +218,25 @@ def prior_energy_wrapper(energy_fn_template):
     return prior_energy
 
 def energy_fn_template(energy_params):
+    vars = {**variables}
+    vars["params"] = energy_params
+
     def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
-        dynamic_kwargs.setdefault("species", species)
+        del mode
+        dynamic_kwargs.setdefault("species", species_init)
         dynamic_kwargs.setdefault("box", box)
-        
-        return gnn_energy_fn(energy_params, pos, neighbor, **dynamic_kwargs)
+        mask = dynamic_kwargs.pop("mask", jnp.ones(pos.shape[0], dtype=jnp.bool_))
+
+        pots = gnn_energy_fn(vars, pos, neighbor, **dynamic_kwargs)
+        if pots.ndim == 2 and pots.shape[-1] == 1:
+            pots = pots.squeeze(-1)
+
+        atomic_numbers = jnp.asarray(model_config["atomic_numbers"], dtype=jnp.int32)
+        atomic_energies = jnp.asarray(model_config["atomic_energies"], dtype=jnp.float32)
+        mapped_species = jnp.argmax(dynamic_kwargs["species"][:, None] == atomic_numbers[None, :], axis=-1)
+
+        pots = (pots - atomic_energies[mapped_species]) * mask
+        return jnp.sum(pots)
     
     if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
         # Hexane, two-site
