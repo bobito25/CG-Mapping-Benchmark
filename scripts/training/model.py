@@ -36,7 +36,7 @@ class GumbelCGAssignment(fnn.Module):
             
             def custom_init(key, shape, dtype=jnp.float32):
                 one_hot_map = jax.nn.one_hot(initial_map_arr, self.num_cg_beads, dtype=dtype)
-                return one_hot_map * 10.0
+                return one_hot_map * 5.0
 
             logits = fnn.Dense(self.num_cg_beads, kernel_init=custom_init, bias_init=fnn.initializers.zeros)(node_attrs)
         else:

@@ -43,7 +43,7 @@ class CGForceMatching(ForceMatching):
             )
 
             displacement_fn_X, shift_fn_X = space.periodic_general(
-                box=batch["box"][0], fractional_coordinates=False
+                box=batch["box"][0], fractional_coordinates=True
             )
 
             # Map AT -> CG for both R and F dynamically

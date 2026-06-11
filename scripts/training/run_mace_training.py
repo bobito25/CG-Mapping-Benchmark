@@ -81,22 +81,12 @@ else:
         "Invalid molecule. Use 'ala2', 'ala15', 'hexane', 'pro2', 'thr2', or 'gly2'."
     )
     
-# AT
-if MACE_CONFIG["type"] == "AT":
-    dataset = data.dataset_U
-    species = data.species
-    masses = data.masses
-    n_species = data.n_species
-    
-# CG
-elif MACE_CONFIG["type"] == "CG":
-    data.coarse_grain(map=MACE_CONFIG["CG_map"])
-    dataset = data.cg_dataset_U
-    species = data.cg_species
-    masses = data.cg_masses
-    n_species = data.n_cg_species
-else:
-    raise ValueError("Invalid simulation type. Use 'AT' or 'CG'.")
+# We always load the atomistic dataset for learned coarse-graining
+# since we need the atomistic positions R and forces F to map from.
+dataset = data.dataset_U
+species = data.species
+masses = data.masses
+n_species = data.n_species
 
 output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}_corr={MACE_CONFIG['correlation']}_seed={MACE_CONFIG['PRNGKey_seed']}_prior={MACE_CONFIG['use_bond_priors']}"
 os.makedirs(output_dir, exist_ok=True)
@@ -107,9 +97,74 @@ os.makedirs(output_dir, exist_ok=True)
 box = data.box
 displacement_fn, _ = space.periodic_general(box=box, fractional_coordinates=True)
 
+# Lookup target map and num_cg_beads
+num_cg_beads = 10
+initial_mapping = None
+target_map_name = args.cgmap
+if target_map_name == "AT":
+    target_map_name = "hmerged"  # Default heuristic map for learned CG mapping
+
+mol_name_map = {
+    "ala2": "Ala2_Map",
+    "ala15": "Ala15_Map",
+    "hexane": "Hexane_Map",
+    "pro2": "Pro2_Map",
+    "thr2": "Thr2_Map",
+    "gly2": "Gly2_Map",
+}
+
+if args.mol in mol_name_map:
+    class_name = mol_name_map[args.mol]
+    map_class = getattr(mapping, class_name, None)
+    if map_class is not None:
+        try:
+            map_inst = map_class()
+            # If target_map_name is not in the maps, look for a 10-bead map
+            if target_map_name not in map_inst.get_available_maps():
+                for map_name in map_inst.get_available_maps():
+                    indices, cg_species, _, _ = map_inst.get_map(map_name)
+                    if len(cg_species) == 10:
+                        target_map_name = map_name
+                        break
+            
+            if target_map_name in map_inst.get_available_maps():
+                indices, cg_species, _, _ = map_inst.get_map(target_map_name)
+                num_cg_beads = len(cg_species)
+                indices_clean = [idx if idx >= 0 else 0 for idx in indices]
+                initial_mapping = tuple(indices_clean)
+                print(f"[INFO] Initializing learned CG mapping using heuristic '{target_map_name}' map: {initial_mapping}")
+                print(f"[INFO] Number of CG beads: {num_cg_beads}")
+            else:
+                print(f"[WARNING] No map found. Using default 10 beads.")
+        except Exception as e:
+            print(f"[WARNING] Error reading heuristic map for initialization: {e}")
+
+# Create initial mapping matrix for neighbor list allocation
+initial_map_arr = jnp.array(initial_mapping, dtype=jnp.int32)
+one_hot_map = jax.nn.one_hot(initial_map_arr, num_cg_beads).T  # [num_cg_beads, num_atoms]
+atoms_per_bead = jnp.sum(one_hot_map, axis=-1, keepdims=True) + 1e-8
+c_map_init = one_hot_map / atoms_per_bead
+
+displacement_fn_X, shift_fn_X = space.periodic_general(box=box, fractional_coordinates=True)
+cg_positions_init, _ = mapping.map_dataset(
+    dataset["training"]["R"],
+    displacement_fn,
+    shift_fn_X,
+    c_map_init,
+    d_map=c_map_init,
+    force_dataset=jnp.zeros_like(dataset["training"]["R"])
+)
+
+# Allocate neighbor list nbrs_init for CG beads
+cg_dataset_init = {
+    "R": cg_positions_init,
+    "box": dataset["training"]["box"],
+    "mask": jnp.ones((cg_positions_init.shape[0], num_cg_beads), dtype=jnp.bool_)
+}
+
 nbrs_init, (max_neighbors, max_edges, avg_num_neighbors) = (
     preprocessing.allocate_neighborlist(
-        dataset["training"],
+        cg_dataset_init,
         displacement_fn,
         box,
         r_cutoff=MACE_CONFIG["r_cutoff"],
@@ -166,7 +221,7 @@ It primarily contains the 'params' key, which holds the trainable weights of the
 
 init_params = template_vars["params"]
 variables = template_vars
-species_init = jnp.asarray(dataset["training"]["species"][0])
+cg_species_init = jnp.zeros(num_cg_beads, dtype=jnp.int32)
 
 def energy_fn_template(energy_params):
     vars = {**variables}
@@ -174,7 +229,7 @@ def energy_fn_template(energy_params):
 
     def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
         del mode
-        dynamic_kwargs.setdefault("species", species_init)
+        dynamic_kwargs.setdefault("species", cg_species_init)
         dynamic_kwargs.setdefault("box", box)
         mask = dynamic_kwargs.pop("mask", jnp.ones(pos.shape[0], dtype=jnp.bool_))
 
@@ -213,45 +268,9 @@ def energy_fn_template(energy_params):
         return energy_fn
 
 r_init = jnp.asarray(dataset["training"]["R"][0])
-mask_init = jnp.asarray(dataset["training"]["mask"][0])
-nbrs_init = nbrs_init.update(r_init, mask=mask_init)
-
-# Initialize the cg assignment model
-num_cg_beads = 10
-initial_mapping = None
-
-mol_name_map = {
-    "ala2": "Ala2_Map",
-    "ala15": "Ala15_Map",
-    "hexane": "Hexane_Map",
-    "pro2": "Pro2_Map",
-    "thr2": "Thr2_Map",
-    "gly2": "Gly2_Map",
-}
-
-if args.mol in mol_name_map:
-    class_name = mol_name_map[args.mol]
-    map_class = getattr(mapping, class_name, None)
-    if map_class is not None:
-        try:
-            map_inst = map_class()
-            target_map_name = None
-            for map_name in map_inst.get_available_maps():
-                indices, cg_species, _, _ = map_inst.get_map(map_name)
-                if len(cg_species) == num_cg_beads:
-                    target_map_name = map_name
-                    break
-            
-            if target_map_name is not None:
-                indices, _, _, _ = map_inst.get_map(target_map_name)
-                # Some indices might be -1. Assign unmapped atoms to default bead (0)
-                indices_clean = [idx if idx >= 0 else 0 for idx in indices]
-                initial_mapping = tuple(indices_clean)
-                print(f"[INFO] Initializing learned CG mapping using heuristic '{target_map_name}' map: {initial_mapping}")
-            else:
-                print(f"[WARNING] No heuristic map with {num_cg_beads} CG beads found for {args.mol}.")
-        except Exception as e:
-            print(f"[WARNING] Error reading heuristic map for initialization: {e}")
+r_init_cg = cg_positions_init[0]
+mask_init_cg = jnp.ones(num_cg_beads, dtype=jnp.bool_)
+nbrs_init = nbrs_init.update(r_init_cg, mask=mask_init_cg)
 
 cg_model = GumbelCGAssignment(num_cg_beads=num_cg_beads, initial_mapping=initial_mapping)
 cg_params = cg_model.init(
@@ -344,6 +363,11 @@ def print_learned_mapping(trainer, *args, **kwargs):
                 assignments = jnp.argmax(logits, axis=-1)
                 epoch = trainer._epoch
                 print(f"\n--- Learned CG Mapping at Epoch {epoch} ---")
+                
+                # Print kernel stats
+                k_min, k_max, k_mean = jnp.min(kernel), jnp.max(kernel), jnp.mean(kernel)
+                print(f"[DEBUG] Mapping weights stats - Min: {k_min:.4f}, Max: {k_max:.4f}, Mean: {k_mean:.4f}")
+                
                 assignments_list = [int(x) for x in jax.device_get(assignments)]
                 print(f"Atom assignments to CG beads: {assignments_list}")
                 
