@@ -4,6 +4,31 @@ import functools
 import numpy as np
 
 
+def _map_single(ipt, shift_fn, displacement_fn, c_map, d_map):
+    pos, forc = ipt
+    c_map_sum = jnp.sum(c_map, axis=1, keepdims=True)
+    safe_c_map_sum = jnp.where(c_map_sum > 0.0, c_map_sum, 1.0)
+    c_map = jnp.where(c_map_sum > 0.0, c_map / safe_c_map_sum, 0.0)
+    
+    d_map_sum = jnp.sum(d_map, axis=1, keepdims=True)
+    safe_d_map_sum = jnp.where(d_map_sum > 0.0, d_map_sum, 1.0)
+    d_map = jnp.where(d_map_sum > 0.0, d_map / safe_d_map_sum, 0.0)
+    mask = c_map > 0.0
+
+    ref_idx = jnp.argmax(c_map, axis=1)
+    ref_positions = pos[ref_idx, :]
+
+    disp = jax.vmap(lambda r: jax.vmap(lambda p: displacement_fn(p, r))(pos))(
+        ref_positions
+    )
+
+    cg_disp = jnp.einsum("Ii,Iid->Id", c_map, disp)
+    cg_pos = jax.vmap(shift_fn)(ref_positions, cg_disp)
+
+    cg_forces = jnp.einsum("Ii, id ->Id", mask, forc)
+    return cg_pos, cg_forces
+
+
 def map_dataset(
     position_dataset, displacement_fn, shift_fn, c_map, d_map=None, force_dataset=None
 ):
@@ -44,26 +69,7 @@ def map_dataset(
 
     """
 
-    def _map_single(ipt, shift_fn, displacement_fn, c_map, d_map):
-        pos, forc = ipt
-        c_map /= jnp.sum(c_map, axis=1, keepdims=True)
-        d_map /= jnp.sum(d_map, axis=1, keepdims=True)
-        mask = c_map > 0.0
-
-        ref_idx = jnp.argmax(c_map, axis=1)
-        ref_positions = pos[ref_idx, :]
-
-        disp = jax.vmap(lambda r: jax.vmap(lambda p: displacement_fn(p, r))(pos))(
-            ref_positions
-        )
-
-        cg_disp = jnp.einsum("Ii,Iid->Id", c_map, disp)
-        cg_pos = jax.vmap(shift_fn)(ref_positions, cg_disp)
-
-        cg_forces = jnp.einsum("Ii, id ->Id", mask, forc)
-        return cg_pos, cg_forces
-
-    _map_single = functools.partial(
+    map_single_fn = functools.partial(
         _map_single,
         shift_fn=shift_fn,
         displacement_fn=displacement_fn,
@@ -75,9 +81,9 @@ def map_dataset(
     if debug:
         first_frame = position_dataset[3]
         first_force = force_dataset[3]
-        return _map_single((first_frame, first_force))
+        return map_single_fn((first_frame, first_force))
 
-    return lax.map(_map_single, (position_dataset, force_dataset))
+    return lax.map(map_single_fn, (position_dataset, force_dataset))
 
 
 # atomic‐mass lookup by symbol

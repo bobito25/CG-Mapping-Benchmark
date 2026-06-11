@@ -198,24 +198,24 @@ if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
     print("Using bond priors in simulation energy function.")
 
     
-key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
-#assert key in BOND_SPRING_CONSTANTS
-prior_constants = BOND_SPRING_CONSTANTS[key]
+# key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
+# #assert key in BOND_SPRING_CONSTANTS
+# prior_constants = BOND_SPRING_CONSTANTS[key]
 
-harmonic_energy_fn = energy.simple_spring_bond(
-            displacement_fn, 
-            bond=jnp.asarray(prior_constants['indices']),
-            length=jnp.exp(prior_constants['log_b0']), # b0
-            epsilon=jnp.exp(prior_constants['log_kb']), # kb
-            alpha=2.0 # standard harmonic
-        )
+# harmonic_energy_fn = energy.simple_spring_bond(
+#             displacement_fn, 
+#             bond=jnp.asarray(prior_constants['indices']),
+#             length=jnp.exp(prior_constants['log_b0']), # b0
+#             epsilon=jnp.exp(prior_constants['log_kb']), # kb
+#             alpha=2.0 # standard harmonic
+#         )
 
-def prior_energy_wrapper(energy_fn_template):
-    def prior_energy(state, neighbor, energy_params, **kwargs):
-        energy_fn = energy_fn_template(energy_params)
-        harmonic_energy = energy_fn(state.position)
-        return harmonic_energy
-    return prior_energy
+# def prior_energy_wrapper(energy_fn_template):
+#     def prior_energy(state, neighbor, energy_params, **kwargs):
+#         energy_fn = energy_fn_template(energy_params)
+#         harmonic_energy = energy_fn(state.position)
+#         return harmonic_energy
+#     return prior_energy
 
 def energy_fn_template(energy_params):
     vars = {**variables}
@@ -364,11 +364,11 @@ def init_simulator(
     
     # Setup quantities to record
     quantities = {
-        "kT": custom_quantity.temperature,
+        # "kT": custom_quantity.temperature,
         "epot": custom_quantity.energy_wrapper(lambda _: energy_fn),
-        "force": custom_quantity.force_wrapper(lambda _: energy_fn),
-        "etot": custom_quantity.total_energy_wrapper(lambda _: energy_fn),
-        "eprior": prior_energy_wrapper(lambda _: harmonic_energy_fn),
+        # "force": custom_quantity.force_wrapper(lambda _: energy_fn),
+        # "etot": custom_quantity.total_energy_wrapper(lambda _: energy_fn),
+        # "eprior": prior_energy_wrapper(lambda _: harmonic_energy_fn),
     }
 
     # Initialize trajectory generator

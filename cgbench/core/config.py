@@ -54,7 +54,7 @@ DEFAULT_NEQUIP_CONFIG = {
 DEFAULT_TRAIN_CONFIG = {
     "batch_size": 32,
     "init_lr": 0.001,
-    "num_epochs": 50,
+    "num_epochs": 25,
     "decay_rate": 0.90,
     "optimizer": "adam+decay",
 }
@@ -66,8 +66,8 @@ DEFAULT_SIM_CONFIG = {
     "sim_mode": "sampling",  # simulation mode: 'sampling', 'stability', 'helix', 'speed'
     "ensemble": "NVT", # NVT or NVE
     "t_eq": 0,  # Equlibration time in ps
-    "t_total": 1000,  # Total simulation time in ps (- t_eq)
-    "n_chains": 10, # Number of simulations (parallel)
+    "t_total": 100,  # Total simulation time in ps (- t_eq)
+    "n_chains": 5, # Number of simulations (parallel)
     "kT": 300.0 * quantity.kb,  # Temperature in energy units
     "T": 300.0,
     "PRNGKey_seed": SEED,

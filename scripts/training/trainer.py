@@ -1,0 +1,91 @@
+import jax
+import jax.numpy as jnp
+from chemtrain.trainers import ForceMatching
+from chemtrain.learn import max_likelihood
+from jax_md import space
+from cgbench.core.mapping import _map_single as cg_map_single
+from typing import Dict, Any
+
+class CGForceMatching(ForceMatching):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, **kwargs):
+        self.model_cg_map = model_cg_map
+        self.nbrs_init = nbrs_init
+        
+        # Wrap update_fn of nbrs_init to stop gradients on position
+        original_update_fn = nbrs_init.update_fn
+        nbrs_init_stopped = nbrs_init.set(
+            update_fn=lambda pos, *args, **kwargs: original_update_fn(jax.lax.stop_gradient(pos), *args, **kwargs)
+        )
+        
+        # Initialize the standard ForceMatching first to get the default model and loss
+        super().__init__(init_params, optimizer, energy_fn_template, nbrs_init_stopped, **kwargs)
+
+        # Extract chemtrain's default functions
+        base_model = self.batched_model
+        base_loss_fn = self._loss_fn
+
+        # Create a wrapper model that mutates the batch inside the JAX trace
+        def cg_batched_model(params: Dict[str, Any], batch: Dict[str, Any]) -> Dict[str, Any]:
+            # batch contains atomistic data:
+            # - 'R': Atomistic coordinates (batch_size, n_atoms, 3)
+            # - 'F': Target atomistic forces (batch_size, n_atoms, 3)
+            # - 'box': Simulation box dimensions (batch_size, 3)
+            # - 'species': Atom species (batch_size, n_atoms)
+            # - 'mask': Atom mask padding (batch_size, n_atoms)
+
+            # Extract PRNGKey hidden in params (handled by DataParallelTrainer later)
+            prng_key = params.get('Dropout_RNG_key', jax.random.PRNGKey(0))
+
+            # Compute CG assignment
+            c_map = self.model_cg_map.apply(
+                {'params': params['cg_map']}, 
+                batch['R'], batch['species'], prng_key
+            )
+
+            displacement_fn_X, shift_fn_X = space.periodic_general(
+                box=batch["box"][0], fractional_coordinates=False
+            )
+
+            # Map AT -> CG for both R and F dynamically
+            R_cg, F_cg = jax.vmap(cg_map_single, in_axes=(0, None, None, 0, 0))(
+                (batch['R'], batch['F']), shift_fn_X, displacement_fn_X, c_map, c_map
+            )
+
+            # Pass placeholder species and masks for the target CG layer
+            cg_species = jnp.zeros(R_cg.shape[:-1], dtype=jnp.int32)
+            cg_mask = jnp.sum(c_map, axis=-1) > 0.0
+
+            cg_batch = {
+                **batch, 
+                'R': R_cg,
+                'F': F_cg, 
+                'species': cg_species,
+                'mask': cg_mask,
+            }
+
+            # Run chemtrain's standard model on the CG proxy batch
+            predictions = base_model(params['mace'], cg_batch)
+
+            # Push mapped reference forces into predictions so custom loss can find them
+            predictions['Mapped_Target_F'] = F_cg
+            return predictions
+
+        # Create a custom loss that looks at the mapped targets instead of the original batch targets
+        def cg_loss_fn(predictions, original_batch):
+            # We construct a proxy batch that contains the dynamically mapped F_cg
+            proxy_batch = {**original_batch, 'F': predictions['Mapped_Target_F']}
+            return base_loss_fn(predictions, proxy_batch)
+        # Overwrite the tracked references
+        self.batched_model = cg_batched_model
+        self._loss_fn = cg_loss_fn
+
+        # Recompile the _update_fn and _evaluate_fn to use new cg_batched_model instead
+        if self._disable_shmap:
+            self._update_fn = max_likelihood.pmap_update_fn(
+                self.batched_model, self._loss_fn, optimizer, penalty_fn=kwargs.get('penalty_fn'))
+            self._evaluate_fn = None
+        else:
+            self._update_fn = max_likelihood.shmap_update_fn(
+                self.batched_model, self._loss_fn, optimizer, penalty_fn=kwargs.get('penalty_fn'))
+            self._evaluate_fn = max_likelihood.shmap_loss_fn(
+                self.batched_model, self._loss_fn, penalty_fn=kwargs.get('penalty_fn'))

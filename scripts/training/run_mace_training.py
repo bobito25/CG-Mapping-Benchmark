@@ -27,17 +27,20 @@ if args.device:
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.97"
 
+import jax
 import numpy as onp
 import optax
-from chemtrain import trainers
+from trainer import CGForceMatching
 from chemtrain.data import preprocessing
 from chemtrain.compose import mace_jax as mace_jax_compose
 import json
 from jax import numpy as jnp, tree_util
 from mace_jax.modules.wrapper_ops import CuEquivarianceConfig
-from cgbench.core import dataset
+from cgbench.core import dataset, mapping
 from cgbench.core.config import DEFAULT_MACE_CONFIG as MACE_CONFIG, DEFAULT_TRAIN_CONFIG as TRAIN_CONFIG, BOND_SPRING_CONSTANTS
 from jax_md import space, energy, partition
+
+from model import GumbelCGAssignment
 
 MACE_CONFIG["r_cutoff"] = args.rcut
 MACE_CONFIG["mol"] = args.mol 
@@ -156,6 +159,10 @@ template_vars, gnn_energy_fn, model_config = mace_jax_compose.mace_jax_neighborl
     mace_config=mace_cfg,
     cueq_config=cueq_config,
 )
+"""
+template_vars: A dictionary-like object (Flax FrozenDict) containing the initialized model variables.
+It primarily contains the 'params' key, which holds the trainable weights of the MACE-JAX model.
+"""
 
 init_params = template_vars["params"]
 variables = template_vars
@@ -209,6 +216,75 @@ r_init = jnp.asarray(dataset["training"]["R"][0])
 mask_init = jnp.asarray(dataset["training"]["mask"][0])
 nbrs_init = nbrs_init.update(r_init, mask=mask_init)
 
+# Initialize the cg assignment model
+num_cg_beads = 10
+initial_mapping = None
+
+mol_name_map = {
+    "ala2": "Ala2_Map",
+    "ala15": "Ala15_Map",
+    "hexane": "Hexane_Map",
+    "pro2": "Pro2_Map",
+    "thr2": "Thr2_Map",
+    "gly2": "Gly2_Map",
+}
+
+if args.mol in mol_name_map:
+    class_name = mol_name_map[args.mol]
+    map_class = getattr(mapping, class_name, None)
+    if map_class is not None:
+        try:
+            map_inst = map_class()
+            target_map_name = None
+            for map_name in map_inst.get_available_maps():
+                indices, cg_species, _, _ = map_inst.get_map(map_name)
+                if len(cg_species) == num_cg_beads:
+                    target_map_name = map_name
+                    break
+            
+            if target_map_name is not None:
+                indices, _, _, _ = map_inst.get_map(target_map_name)
+                # Some indices might be -1. Assign unmapped atoms to default bead (0)
+                indices_clean = [idx if idx >= 0 else 0 for idx in indices]
+                initial_mapping = tuple(indices_clean)
+                print(f"[INFO] Initializing learned CG mapping using heuristic '{target_map_name}' map: {initial_mapping}")
+            else:
+                print(f"[WARNING] No heuristic map with {num_cg_beads} CG beads found for {args.mol}.")
+        except Exception as e:
+            print(f"[WARNING] Error reading heuristic map for initialization: {e}")
+
+cg_model = GumbelCGAssignment(num_cg_beads=num_cg_beads, initial_mapping=initial_mapping)
+cg_params = cg_model.init(
+    jax.random.PRNGKey(0),
+    r_init,
+    dataset["training"]["species"][0],
+    jax.random.PRNGKey(1)
+)
+
+#def combined_energy_fn_template(joint_params):
+#    # Pass in both CG mapping and MACE params inside a tree
+#    mace_energy_fn = energy_fn_template(joint_params['mace'])
+#    
+#    # We must construct a wrapper that takes the ATOMISTIC positions 
+#    # but delegates to MACE after mapping
+#    def forward_call(pos, neighbor, mode=None, **dynamic_kwargs):
+#        # 1. Pull the stochastic key from kwargs (injected by updated trainer step)
+#        prng_key = dynamic_kwargs.get("prng_key", jax.random.PRNGKey(0))
+#        
+#        # 2. Get Softmax Map
+#        c_map = cg_model.apply({'params': joint_params['cg_map']}, pos, dynamic_kwargs['node_attrs'], prng_key)
+#        
+#        # 3. Map Coordinates Dynamically (in-tape!)
+#        displacement_fn, shift_fn_X = space.periodic_general(box=box, fractional_coordinates=False)
+#        pos_cg, _ = mapping.map_dataset(pos, displacement_fn, shift_fn_X, c_map, d_map=c_map)
+#        
+#        # 4. Detach for Neighbor updates
+#        cg_nbrs = neighbor.update(jax.lax.stop_gradient(pos_cg))
+#        
+#        # 5. Delegate to MACE
+#        return mace_energy_fn(pos_cg, cg_nbrs, mode=mode, **dynamic_kwargs)
+#        
+#    return forward_call
 
 # -------------------------
 # Setup optimizer
@@ -237,18 +313,50 @@ if args.verbose:
     print(f"Batch size: {batch_size}")
     print(f"Number of epochs: {epochs}")
 
-
 # -------------------------
 # Setup trainer
 # -------------------------
-trainer_fm = trainers.ForceMatching(
-    init_params,
+joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
+trainer_fm = CGForceMatching(
+    joint_params,
     optimizer_fm,
     energy_fn_template,
     nbrs_init,
     log_file=f"{output_dir}/force_matching.log",
     batch_per_device=int(batch_size),
+    model_cg_map=cg_model,
 )
+
+def print_learned_mapping(trainer, *args, **kwargs):
+    cg_map_params = trainer.params.get('cg_map', None)
+    if cg_map_params is not None:
+        dense_keys = [k for k in cg_map_params.keys() if 'Dense' in k]
+        if dense_keys:
+            dense_params = cg_map_params[dense_keys[0]]
+            kernel = dense_params.get('kernel', None)
+            bias = dense_params.get('bias', None)
+            if kernel is not None:
+                if bias is not None:
+                    logits = kernel + bias[None, :]
+                else:
+                    logits = kernel
+                
+                assignments = jnp.argmax(logits, axis=-1)
+                epoch = trainer._epoch
+                print(f"\n--- Learned CG Mapping at Epoch {epoch} ---")
+                assignments_list = [int(x) for x in jax.device_get(assignments)]
+                print(f"Atom assignments to CG beads: {assignments_list}")
+                
+                bead_to_atoms = {}
+                for atom_idx, bead_idx in enumerate(assignments_list):
+                    bead_to_atoms.setdefault(bead_idx, []).append(atom_idx)
+                
+                print("CG Beads to Atoms:")
+                for bead_idx in sorted(bead_to_atoms.keys()):
+                    print(f"  Bead {bead_idx}: Atoms {bead_to_atoms[bead_idx]}")
+                print("-------------------------------------------\n", flush=True)
+
+trainer_fm.add_task("post_epoch", print_learned_mapping)
 trainer_fm.set_dataset(dataset["training"], stage="training")
 trainer_fm.set_dataset(dataset["validation"], stage="validation", include_all=True)
 if "testing" in dataset:
