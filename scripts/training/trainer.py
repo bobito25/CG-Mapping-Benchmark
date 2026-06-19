@@ -68,13 +68,29 @@ class CGForceMatching(ForceMatching):
 
             # Push mapped reference forces into predictions so custom loss can find them
             predictions['Mapped_Target_F'] = F_cg
+            predictions['cg_mask'] = cg_mask
             return predictions
 
         # Create a custom loss that looks at the mapped targets instead of the original batch targets
         def cg_loss_fn(predictions, original_batch):
             # We construct a proxy batch that contains the dynamically mapped F_cg
             proxy_batch = {**original_batch, 'F': predictions['Mapped_Target_F']}
-            return base_loss_fn(predictions, proxy_batch)
+            loss_val, errors = base_loss_fn(predictions, proxy_batch)
+            
+            # Retrieve mask of shape (batch_size, num_cg_beads)
+            cg_mask = predictions['cg_mask']
+            total_beads = cg_mask.size
+            num_active_beads = jnp.sum(cg_mask)
+            
+            # Scale factor to divide by active beads instead of total beads
+            scale_factor = total_beads / (num_active_beads + 1e-8)
+            
+            scaled_F_error = errors['F'] * scale_factor
+            corrected_loss = loss_val - errors['F'] + scaled_F_error
+            
+            errors['F'] = scaled_F_error
+            return corrected_loss, errors
+
         # Overwrite the tracked references
         self.batched_model = cg_batched_model
         self._loss_fn = cg_loss_fn

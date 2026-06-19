@@ -57,6 +57,7 @@ DEFAULT_TRAIN_CONFIG = {
     "num_epochs": 25,
     "decay_rate": 0.90,
     "optimizer": "adam+decay",
+    "cg_save_freq": 1,
 }
 
 DEFAULT_SIM_CONFIG = {

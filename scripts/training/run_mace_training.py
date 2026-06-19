@@ -280,31 +280,6 @@ cg_params = cg_model.init(
     jax.random.PRNGKey(1)
 )
 
-#def combined_energy_fn_template(joint_params):
-#    # Pass in both CG mapping and MACE params inside a tree
-#    mace_energy_fn = energy_fn_template(joint_params['mace'])
-#    
-#    # We must construct a wrapper that takes the ATOMISTIC positions 
-#    # but delegates to MACE after mapping
-#    def forward_call(pos, neighbor, mode=None, **dynamic_kwargs):
-#        # 1. Pull the stochastic key from kwargs (injected by updated trainer step)
-#        prng_key = dynamic_kwargs.get("prng_key", jax.random.PRNGKey(0))
-#        
-#        # 2. Get Softmax Map
-#        c_map = cg_model.apply({'params': joint_params['cg_map']}, pos, dynamic_kwargs['node_attrs'], prng_key)
-#        
-#        # 3. Map Coordinates Dynamically (in-tape!)
-#        displacement_fn, shift_fn_X = space.periodic_general(box=box, fractional_coordinates=False)
-#        pos_cg, _ = mapping.map_dataset(pos, displacement_fn, shift_fn_X, c_map, d_map=c_map)
-#        
-#        # 4. Detach for Neighbor updates
-#        cg_nbrs = neighbor.update(jax.lax.stop_gradient(pos_cg))
-#        
-#        # 5. Delegate to MACE
-#        return mace_energy_fn(pos_cg, cg_nbrs, mode=mode, **dynamic_kwargs)
-#        
-#    return forward_call
-
 # -------------------------
 # Setup optimizer
 # -------------------------
@@ -335,6 +310,7 @@ if args.verbose:
 # -------------------------
 # Setup trainer
 # -------------------------
+cg_save_freq = TRAIN_CONFIG.get("cg_save_freq", 5)
 joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
 trainer_fm = CGForceMatching(
     joint_params,
@@ -345,6 +321,8 @@ trainer_fm = CGForceMatching(
     batch_per_device=int(batch_size),
     model_cg_map=cg_model,
 )
+trainer_fm.cg_save_freq = cg_save_freq
+trainer_fm.saved_cg_maps = {}
 
 def print_learned_mapping(trainer, *args, **kwargs):
     cg_map_params = trainer.params.get('cg_map', None)
@@ -370,6 +348,13 @@ def print_learned_mapping(trainer, *args, **kwargs):
                 
                 assignments_list = [int(x) for x in jax.device_get(assignments)]
                 print(f"Atom assignments to CG beads: {assignments_list}")
+                
+                # Save CG map every x epochs and at the final epoch
+                if not hasattr(trainer, "saved_cg_maps"):
+                    trainer.saved_cg_maps = {}
+                cg_save_freq = getattr(trainer, "cg_save_freq", 5)
+                if epoch % cg_save_freq == 0 or epoch == epochs - 1:
+                    trainer.saved_cg_maps[int(epoch)] = assignments_list
                 
                 bead_to_atoms = {}
                 for atom_idx, bead_idx in enumerate(assignments_list):
@@ -401,6 +386,55 @@ with open(f"{output_dir}/config.json", "w") as f:
 # Save training config as json
 with open(f"{output_dir}/train_config.json", "w") as f:
     json.dump(TRAIN_CONFIG, f, indent=4)
+
+# Save cg maps to json
+cg_maps_path = f"{output_dir}/cg_maps.json"
+with open(cg_maps_path, "w") as f:
+    json.dump(trainer_fm.saved_cg_maps, f, indent=4)
+print(f"[INFO] Saved CG maps to {cg_maps_path}")
+
+# Create visualization of CG maps over time
+try:
+    import sys
+    # Add mapping_viz to sys.path
+    viz_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../mapping_viz"))
+    if viz_dir not in sys.path:
+        sys.path.insert(0, viz_dir)
+    from viz import visualize_mapping_grid
+    from rdkit import Chem
+    
+    MOLECULE_SMILES = {
+        "ala2": "CC(=O)N[C@@H](C)C(=O)NC",
+        "hexane": "CCCCCC",
+        "pro2": "CC(=O)N1CCC[C@H]1C(=O)NC",
+        "thr2": "CC(=O)N[C@@H]([C@H](O)C)C(=O)NC",
+        "gly2": "CC(=O)NCC(=O)NC",
+    }
+    
+    mol_name = MACE_CONFIG["mol"]
+    smiles = MOLECULE_SMILES.get(mol_name)
+    if smiles is not None:
+        mol = Chem.MolFromSmiles(smiles)
+        mol = Chem.AddHs(mol)
+        
+        # Renumber if it's ala2 (matching the renumbering in viz.py main)
+        if mol_name == "ala2":
+            permutation = [0,10,11,12,1,2,3,13,4,14,5,15,16,17,6,7,8,18,9,19,20,21]
+            mol = Chem.RenumberAtoms(mol, permutation)
+            print(f"[INFO] Renumbered atoms for {mol_name} using permutation.")
+            
+        sorted_epochs = sorted(trainer_fm.saved_cg_maps.keys())
+        mappings = [trainer_fm.saved_cg_maps[ep] for ep in sorted_epochs]
+        legends = [f"Epoch {ep}" for ep in sorted_epochs]
+        epoch_species = [list(range(num_cg_beads)) for _ in sorted_epochs]
+        
+        output_image_path = f"{output_dir}/cg_maps_over_time.png"
+        visualize_mapping_grid(mol, mappings, legends, epoch_species, output_image_path)
+        print(f"[INFO] Saved CG maps visualization to {output_image_path}")
+    else:
+        print(f"[WARNING] SMILES not found for molecule {mol_name}. Skipping visualization.")
+except Exception as e:
+    print(f"[WARNING] Could not generate CG maps visualization: {e}")
 
 from cgbench.plotting.training import plot_predictions, plot_convergence
 
