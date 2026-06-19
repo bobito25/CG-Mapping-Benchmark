@@ -7,9 +7,10 @@ from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
+        self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
         
         # Wrap update_fn of nbrs_init to stop gradients on position
         original_update_fn = nbrs_init.update_fn
@@ -51,8 +52,8 @@ class CGForceMatching(ForceMatching):
                 (batch['R'], batch['F']), shift_fn_X, displacement_fn_X, c_map, c_map
             )
 
-            # Pass placeholder species and masks for the target CG layer
-            cg_species = jnp.zeros(R_cg.shape[:-1], dtype=jnp.int32)
+            # Pass actual CG species and masks for the target CG layer
+            cg_species = jnp.tile(self.cg_species, (R_cg.shape[0], 1))
             cg_mask = jnp.sum(c_map, axis=-1) > 0.0
 
             cg_batch = {
