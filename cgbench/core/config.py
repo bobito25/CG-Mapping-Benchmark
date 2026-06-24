@@ -58,6 +58,7 @@ DEFAULT_TRAIN_CONFIG = {
     "decay_rate": 0.90,
     "optimizer": "adam+decay",
     "cg_save_freq": 1,
+    "gumbel_temp": 1.0,
 }
 
 DEFAULT_SIM_CONFIG = {

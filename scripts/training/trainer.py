@@ -7,10 +7,13 @@ from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
+        self.atom_masses = jnp.asarray(atom_masses, dtype=jnp.float32)
+        self.freeze_cg = freeze_cg
+        self.temperature = 1.0
         
         # Wrap update_fn of nbrs_init to stop gradients on position
         original_update_fn = nbrs_init.update_fn
@@ -34,13 +37,25 @@ class CGForceMatching(ForceMatching):
             # - 'species': Atom species (batch_size, n_atoms)
             # - 'mask': Atom mask padding (batch_size, n_atoms)
 
-            # Extract PRNGKey hidden in params (handled by DataParallelTrainer later)
-            prng_key = params.get('Dropout_RNG_key', jax.random.PRNGKey(0))
+            # Use batch-specific PRNGKey if available, otherwise fallback
+            if 'rng' in batch:
+                prng_key = batch['rng'][0]
+            else:
+                prng_key = params.get('Dropout_RNG_key', jax.random.PRNGKey(0))
+
+            # Deterministic if freeze_cg is True, or if batch has no rng (validation/evaluation/predictions)
+            deterministic = self.freeze_cg or ('rng' not in batch)
+
+            # Retrieve temperature from batch or default to 1.0 (not used during deterministic evaluation)
+            temperature = batch.get('temperature', jnp.array(1.0, dtype=jnp.float32))
 
             # Compute CG assignment
             c_map = self.model_cg_map.apply(
                 {'params': params['cg_map']}, 
-                batch['R'], batch['species'], prng_key
+                batch['R'], batch['species'], prng_key,
+                self.atom_masses,
+                deterministic=deterministic,
+                temperature=temperature
             )
 
             displacement_fn_X, shift_fn_X = space.periodic_general(
@@ -56,8 +71,11 @@ class CGForceMatching(ForceMatching):
             cg_species = jnp.tile(self.cg_species, (R_cg.shape[0], 1))
             cg_mask = jnp.sum(c_map, axis=-1) > 0.0
 
+            # Exclude temperature from cg_batch to prevent vmap ranking errors in base_model
+            clean_batch = {k: v for k, v in batch.items() if k != 'temperature'}
+
             cg_batch = {
-                **batch, 
+                **clean_batch, 
                 'R': R_cg,
                 'F': F_cg, 
                 'species': cg_species,
@@ -106,3 +124,8 @@ class CGForceMatching(ForceMatching):
                 self.batched_model, self._loss_fn, optimizer, penalty_fn=kwargs.get('penalty_fn'))
             self._evaluate_fn = max_likelihood.shmap_loss_fn(
                 self.batched_model, self._loss_fn, penalty_fn=kwargs.get('penalty_fn'))
+
+    def _update(self, batch):
+        # Inject current temperature into batch dictionary as a JAX array to prevent re-compilation
+        batch['temperature'] = jnp.array(self.temperature, dtype=jnp.float32)
+        super()._update(batch)

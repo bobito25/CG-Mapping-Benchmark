@@ -21,6 +21,17 @@ parser.add_argument(
     action="store_true",
     help="Use SO(3) equivariance in MACE instead of O(3) (disables cueq)",
 )
+parser.add_argument(
+    "--freeze-cg",
+    action="store_true",
+    help="Freeze learned CG mapping weights after initialization",
+)
+parser.add_argument(
+    "--gumbel-temp",
+    type=str,
+    help="Gumbel temperature configuration: a number for constant temp or a string for schedule ('exponential' or 'linear')",
+    default=None,
+)
 args = parser.parse_args()
 
 if args.device:
@@ -51,7 +62,15 @@ MACE_CONFIG["mol"] = args.mol
 MACE_CONFIG["CG_map"] = cg_map_choice
 MACE_CONFIG["use_bond_priors"] = args.prior
 MACE_CONFIG["type"] = "CG" if MACE_CONFIG["CG_map"] != "AT" else "AT"
-TRAIN_CONFIG["num_epochs"] = 1
+MACE_CONFIG["freeze_cg"] = args.freeze_cg or MACE_CONFIG.get("freeze_cg", False)
+
+gumbel_temp_choice = args.gumbel_temp
+if gumbel_temp_choice is None:
+    gumbel_temp_choice = TRAIN_CONFIG.get("gumbel_temp", "exponential")
+TRAIN_CONFIG["gumbel_temp"] = gumbel_temp_choice
+if MACE_CONFIG["freeze_cg"] and MACE_CONFIG["CG_map"] != "learned":
+    print("[WARNING] --freeze-cg was specified, but CG mapping choice is not 'learned'. Freezing has no effect.")
+
 
 # -------------------------
 # Load dataset
@@ -100,7 +119,15 @@ else:
     masses = data.masses
     n_species = data.n_species
 
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}_corr={MACE_CONFIG['correlation']}_seed={MACE_CONFIG['PRNGKey_seed']}_prior={MACE_CONFIG['use_bond_priors']}"
+if MACE_CONFIG["CG_map"] == "learned":
+    freeze_suffix = f"_freezecg={MACE_CONFIG['freeze_cg']}"
+    gumbel_temp_suffix = f"_gumbeltemp={TRAIN_CONFIG['gumbel_temp']}"
+    print("[INFO] Gumbel temperature: ", TRAIN_CONFIG["gumbel_temp"])
+else:
+    freeze_suffix = ""
+    gumbel_temp_suffix = ""
+
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}"
 os.makedirs(output_dir, exist_ok=True)
 
 # -------------------------
@@ -319,7 +346,9 @@ if MACE_CONFIG["CG_map"] == "learned":
         jax.random.PRNGKey(0),
         r_init,
         dataset["training"]["species"][0],
-        jax.random.PRNGKey(1)
+        jax.random.PRNGKey(1),
+        atom_masses=masses,
+        deterministic=False
     )
 else:
     mask_init = jnp.asarray(dataset["training"]["mask"][0])
@@ -360,6 +389,15 @@ from chemtrain.trainers import ForceMatching
 if MACE_CONFIG["CG_map"] == "learned":
     cg_save_freq = TRAIN_CONFIG.get("cg_save_freq", 5)
     joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
+    
+    if MACE_CONFIG["freeze_cg"]:
+        print("[INFO] Freezing learned CG assignment weights.")
+        labels = {'mace': 'trainable', 'cg_map': 'frozen'}
+        optimizer_fm = optax.multi_transform(
+            {'trainable': optimizer_fm, 'frozen': optax.set_to_zero()},
+            labels
+        )
+
     trainer_fm = CGForceMatching(
         joint_params,
         optimizer_fm,
@@ -369,6 +407,8 @@ if MACE_CONFIG["CG_map"] == "learned":
         batch_per_device=int(batch_size),
         model_cg_map=cg_model,
         cg_species=cg_species,
+        atom_masses=masses,
+        freeze_cg=MACE_CONFIG["freeze_cg"]
     )
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}
@@ -414,6 +454,26 @@ if MACE_CONFIG["CG_map"] == "learned":
                         print(f"  Bead {bead_idx}: Atoms {bead_to_atoms[bead_idx]}")
                     print("-------------------------------------------\n", flush=True)
 
+    def update_gumbel_temperature(trainer, *args, **kwargs):
+        epoch = trainer._epoch
+        try:
+            gumbel_temp_val = float(gumbel_temp_choice)
+            trainer.temperature = gumbel_temp_val
+            if epoch == 0:
+                print(f"[INFO] Gumbel-Softmax temperature set to constant {trainer.temperature:.4f}")
+        except ValueError:
+            t_start = 1.0
+            t_min = 0.1
+            if gumbel_temp_choice == "exponential":
+                decay_rate = (t_min / t_start) ** (1.0 / (epochs - 1)) if epochs > 1 else 1.0
+                trainer.temperature = max(t_min, t_start * (decay_rate ** epoch))
+            elif gumbel_temp_choice == "linear":
+                trainer.temperature = max(t_min, t_start - (t_start - t_min) * (epoch / (epochs - 1)) if epochs > 1 else 0.0)
+            else:
+                raise ValueError(f"Unknown Gumbel temperature schedule: {gumbel_temp_choice}")
+            print(f"[INFO] Gumbel-Softmax temperature set to {trainer.temperature:.4f} for Epoch {epoch}")
+
+    trainer_fm.add_task("pre_epoch", update_gumbel_temperature)
     trainer_fm.add_task("post_epoch", print_learned_mapping)
 else:
     # Standard Force Matching for AT or static CG
@@ -426,7 +486,7 @@ else:
         batch_per_device=int(batch_size),
     )
 
-trainer_fm.set_dataset(dataset["training"], stage="training")
+trainer_fm.set_dataset(dataset["training"], stage="training", rng_seed=MACE_CONFIG.get("PRNGKey_seed", 42))
 trainer_fm.set_dataset(dataset["validation"], stage="validation", include_all=True)
 if "testing" in dataset:
     trainer_fm.set_dataset(dataset["testing"], stage="testing", include_all=True)
