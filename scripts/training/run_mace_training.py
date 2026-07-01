@@ -190,11 +190,13 @@ if MACE_CONFIG["CG_map"] == "learned":
     n_species = n_cg_species
     print(f"[INFO] MACE model initialized with {n_species} CG species: {set(cg_species.tolist())}")
 
-    # Create initial mapping matrix for neighbor list allocation
+    # Create mass-weighted mapping matrix for neighbor list allocation
+    # Must match the static path's get_map_weights (m_i / M_I) to ensure
+    # identical avg_num_neighbors and edge capacity for MACE initialization.
     initial_map_arr = jnp.array(initial_mapping, dtype=jnp.int32)
-    one_hot_map = jax.nn.one_hot(initial_map_arr, num_cg_beads).T  # [num_cg_beads, num_atoms]
-    atoms_per_bead = jnp.sum(one_hot_map, axis=-1, keepdims=True) + 1e-8
-    c_map_init = one_hot_map / atoms_per_bead
+    at_masses_arr = jnp.array(masses, dtype=jnp.float32)
+    cg_masses_arr = jax.ops.segment_sum(at_masses_arr, initial_map_arr, num_cg_beads)
+    c_map_init = mapping.get_map_weights(initial_map_arr, at_masses_arr, cg_masses_arr)
 
     displacement_fn_X, shift_fn_X = space.periodic_general(box=box, fractional_coordinates=True)
     cg_positions_init, _ = mapping.map_dataset(
@@ -568,9 +570,14 @@ predictions_val = trainer_fm.predict(
     batch_size=batch_size,
 )
 predictions_val = tree_util.tree_map(onp.asarray, predictions_val)
-plot_predictions(
-    predictions_val, dataset["validation"], output_dir, name="preds_validation"
-)
+if MACE_CONFIG["CG_map"] == "learned":
+    # predictions are at CG resolution; compare against the CG-mapped reference forces
+    cg_ref_val = {"F": predictions_val["Mapped_Target_F"]}
+    plot_predictions(predictions_val, cg_ref_val, output_dir, name="preds_validation")
+else:
+    plot_predictions(
+        predictions_val, dataset["validation"], output_dir, name="preds_validation"
+    )
 
 if "testing" in dataset:
     predictions_test = trainer_fm.predict(
@@ -580,6 +587,10 @@ if "testing" in dataset:
     )
     predictions_test = tree_util.tree_map(onp.asarray, predictions_test)
     onp.savez(f"{output_dir}/predictions_test.npz", **predictions_test)
-    plot_predictions(
-        predictions_test, dataset["testing"], output_dir, name="preds_testing"
-    )
+    if MACE_CONFIG["CG_map"] == "learned":
+        cg_ref_test = {"F": predictions_test["Mapped_Target_F"]}
+        plot_predictions(predictions_test, cg_ref_test, output_dir, name="preds_testing")
+    else:
+        plot_predictions(
+            predictions_test, dataset["testing"], output_dir, name="preds_testing"
+        )

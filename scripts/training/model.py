@@ -56,8 +56,8 @@ class GumbelCGAssignment(fnn.Module):
             # use straight-through estimator to allow gradient flow through soft assignments while using hard assignments in the forward pass
             assignments = jax.lax.stop_gradient(hard_assignments - soft_assignments) + soft_assignments
 
-        # Lookup masses based on node species
-        node_masses = atom_masses[species] # Shape: [..., num_nodes]
+        # Lookup masses based on node index
+        node_masses = jnp.broadcast_to(atom_masses, species.shape) # Shape: [..., num_nodes]
 
         # Weight assignments by mass
         weighted_assignments = assignments * node_masses[..., None]

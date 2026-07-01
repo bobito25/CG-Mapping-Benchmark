@@ -25,7 +25,8 @@ def _map_single(ipt, shift_fn, displacement_fn, c_map, d_map):
     cg_disp = jnp.einsum("Ii,Iid->Id", c_map, disp)
     cg_pos = jax.vmap(shift_fn)(ref_positions, cg_disp)
 
-    cg_forces = jnp.einsum("Ii, id ->Id", mask, forc)
+    ratio = jnp.where(c_map > 0.0, d_map / (c_map + 1e-12), 0.0)
+    cg_forces = jnp.einsum("Ii, id ->Id", ratio, forc)
     return cg_pos, cg_forces
 
 

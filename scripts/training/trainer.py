@@ -88,6 +88,7 @@ class CGForceMatching(ForceMatching):
             # Push mapped reference forces into predictions so custom loss can find them
             predictions['Mapped_Target_F'] = F_cg
             predictions['cg_mask'] = cg_mask
+            predictions['R_cg'] = R_cg
             return predictions
 
         # Create a custom loss that looks at the mapped targets instead of the original batch targets

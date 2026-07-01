@@ -54,7 +54,7 @@ DEFAULT_NEQUIP_CONFIG = {
 DEFAULT_TRAIN_CONFIG = {
     "batch_size": 32,
     "init_lr": 0.001,
-    "num_epochs": 25,
+    "num_epochs": 50,
     "decay_rate": 0.90,
     "optimizer": "adam+decay",
     "cg_save_freq": 1,
