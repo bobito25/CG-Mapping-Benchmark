@@ -32,6 +32,12 @@ parser.add_argument(
     help="Gumbel temperature configuration: a number for constant temp or a string for schedule ('exponential' or 'linear')",
     default=None,
 )
+parser.add_argument(
+    "--epochs",
+    type=int,
+    help="Number of epochs to train",
+    default=None,
+)
 args = parser.parse_args()
 
 if args.device:
@@ -68,6 +74,8 @@ gumbel_temp_choice = args.gumbel_temp
 if gumbel_temp_choice is None:
     gumbel_temp_choice = TRAIN_CONFIG.get("gumbel_temp", "exponential")
 TRAIN_CONFIG["gumbel_temp"] = gumbel_temp_choice
+if args.epochs is not None:
+    TRAIN_CONFIG["num_epochs"] = args.epochs
 if MACE_CONFIG["freeze_cg"] and MACE_CONFIG["CG_map"] != "learned":
     print("[WARNING] --freeze-cg was specified, but CG mapping choice is not 'learned'. Freezing has no effect.")
 
@@ -198,15 +206,30 @@ if MACE_CONFIG["CG_map"] == "learned":
     cg_masses_arr = jax.ops.segment_sum(at_masses_arr, initial_map_arr, num_cg_beads)
     c_map_init = mapping.get_map_weights(initial_map_arr, at_masses_arr, cg_masses_arr)
 
-    displacement_fn_X, shift_fn_X = space.periodic_general(box=box, fractional_coordinates=True)
-    cg_positions_init, _ = mapping.map_dataset(
-        dataset["training"]["R"],
-        displacement_fn,
-        shift_fn_X,
+    box_tensor = box
+    if box_tensor.ndim != 2:
+        box_tensor = onp.eye(box_tensor.shape[0]) * box_tensor
+
+    # Convert initial fractional training coordinates to Cartesian coordinates
+    R_at_cart = onp.dot(dataset["training"]["R"], box_tensor.T)
+
+    displacement_fn_cart, shift_fn_cart = space.periodic_general(
+        box=box_tensor, fractional_coordinates=False
+    )
+
+    # Map initial coordinates in Cartesian space
+    cg_positions_init_cart, _ = mapping.map_dataset(
+        R_at_cart,
+        displacement_fn_cart,
+        shift_fn_cart,
         c_map_init,
         d_map=c_map_init,
-        force_dataset=jnp.zeros_like(dataset["training"]["R"])
+        force_dataset=jnp.zeros_like(R_at_cart)
     )
+
+    # Convert back to fractional coordinates for neighbor list allocation
+    inv_box_tensor = onp.linalg.inv(box_tensor)
+    cg_positions_init = onp.dot(cg_positions_init_cart, inv_box_tensor.T)
 
     # Allocate neighbor list nbrs_init for CG beads
     cg_dataset_init = {

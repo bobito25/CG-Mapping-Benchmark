@@ -58,14 +58,27 @@ class CGForceMatching(ForceMatching):
                 temperature=temperature
             )
 
-            displacement_fn_X, shift_fn_X = space.periodic_general(
-                box=batch["box"][0], fractional_coordinates=True
+            # Convert R to Cartesian space
+            box_tensor = batch["box"][0]
+            if box_tensor.ndim != 2:
+                box_tensor = jnp.eye(box_tensor.shape[0]) * box_tensor
+            
+            # batch['R'] is shape (batch_size, n_atoms, 3)
+            # R_cart = R_frac @ box_tensor^T
+            R_cart = jax.vmap(lambda r: jnp.dot(box_tensor, r.T).T)(batch['R'])
+            
+            displacement_fn_cart, shift_fn_cart = space.periodic_general(
+                box=box_tensor, fractional_coordinates=False
             )
 
-            # Map AT -> CG for both R and F dynamically
-            R_cg, F_cg = jax.vmap(cg_map_single, in_axes=(0, None, None, 0, 0))(
-                (batch['R'], batch['F']), shift_fn_X, displacement_fn_X, c_map, c_map
+            # Map AT -> CG for both R and F dynamically in Cartesian space
+            R_cg_cart, F_cg = jax.vmap(cg_map_single, in_axes=(0, None, None, 0, 0))(
+                (R_cart, batch['F']), shift_fn_cart, displacement_fn_cart, c_map, c_map
             )
+            
+            # Convert R_cg_cart back to fractional coordinates
+            inv_box_tensor = jnp.linalg.inv(box_tensor)
+            R_cg = jax.vmap(lambda r: jnp.dot(inv_box_tensor, r.T).T)(R_cg_cart)
 
             # Pass actual CG species and masks for the target CG layer
             cg_species = jnp.tile(self.cg_species, (R_cg.shape[0], 1))
