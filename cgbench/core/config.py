@@ -54,11 +54,12 @@ DEFAULT_NEQUIP_CONFIG = {
 DEFAULT_TRAIN_CONFIG = {
     "batch_size": 32,
     "init_lr": 0.001,
-    "num_epochs": 50,
+    "num_epochs": 25,
     "decay_rate": 0.90,
     "optimizer": "adam+decay",
     "cg_save_freq": 1,
-    "gumbel_temp": 1.0,
+    "gumbel_temp": 0.0,
+    "empty_bead_penalty_weight": 1000000.0,
 }
 
 DEFAULT_SIM_CONFIG = {

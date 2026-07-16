@@ -433,7 +433,8 @@ if MACE_CONFIG["CG_map"] == "learned":
         model_cg_map=cg_model,
         cg_species=cg_species,
         atom_masses=masses,
-        freeze_cg=MACE_CONFIG["freeze_cg"]
+        freeze_cg=MACE_CONFIG["freeze_cg"],
+        empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0)
     )
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}

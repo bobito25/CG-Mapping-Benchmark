@@ -16,7 +16,8 @@ class GumbelCGAssignment(fnn.Module):
 
     @fnn.compact
     def __call__(self, positions: jnp.ndarray, species: jnp.ndarray, key: jnp.ndarray,
-                 atom_masses: jnp.ndarray, deterministic: bool = False, temperature: float = 1.0) -> jnp.ndarray:
+                 atom_masses: jnp.ndarray, deterministic: bool = False, temperature: float = 1.0,
+                 return_assignments: bool = False) -> jnp.ndarray:
         """
         Assigns each node to a coarse-grained bead using Gumbel-Softmax.
 
@@ -66,4 +67,6 @@ class GumbelCGAssignment(fnn.Module):
         # Transpose the last two dimensions to get [..., num_cg_beads, num_nodes]
         c_map = jnp.swapaxes(weighted_assignments, -1, -2) / jnp.swapaxes(bead_masses, -1, -2)
 
+        if return_assignments:
+            return c_map, assignments
         return c_map

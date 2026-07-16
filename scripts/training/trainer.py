@@ -7,12 +7,13 @@ from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
         self.atom_masses = jnp.asarray(atom_masses, dtype=jnp.float32)
         self.freeze_cg = freeze_cg
+        self.empty_bead_penalty_weight = empty_bead_penalty_weight
         self.temperature = 1.0
         
         # Wrap update_fn of nbrs_init to stop gradients on position
@@ -50,12 +51,13 @@ class CGForceMatching(ForceMatching):
             temperature = batch.get('temperature', jnp.array(1.0, dtype=jnp.float32))
 
             # Compute CG assignment
-            c_map = self.model_cg_map.apply(
+            c_map, assignments = self.model_cg_map.apply(
                 {'params': params['cg_map']}, 
                 batch['R'], batch['species'], prng_key,
                 self.atom_masses,
                 deterministic=deterministic,
-                temperature=temperature
+                temperature=temperature,
+                return_assignments=True
             )
 
             # Convert R to Cartesian space
@@ -102,6 +104,7 @@ class CGForceMatching(ForceMatching):
             predictions['Mapped_Target_F'] = F_cg
             predictions['cg_mask'] = cg_mask
             predictions['R_cg'] = R_cg
+            predictions['assignments'] = assignments
             return predictions
 
         # Create a custom loss that looks at the mapped targets instead of the original batch targets
@@ -122,6 +125,23 @@ class CGForceMatching(ForceMatching):
             corrected_loss = loss_val - errors['F'] + scaled_F_error
             
             errors['F'] = scaled_F_error
+
+            # Add empty bead penalty if weight is positive and assignments are present
+            if 'assignments' in predictions and self.empty_bead_penalty_weight > 0.0:
+                assignments = predictions['assignments']
+                # assignments shape: (batch_size, num_nodes, num_cg_beads)
+                # Sum assignments over nodes to get total assignment count per bead: (batch_size, num_cg_beads)
+                bead_counts = jnp.sum(assignments, axis=-2)
+                # Penalty is relu(1.0 - bead_counts)
+                penalty_per_bead = jax.nn.relu(1.0 - bead_counts)
+                # Mean over batch of the sum of penalties over beads
+                empty_bead_penalty = jnp.mean(jnp.sum(penalty_per_bead, axis=-1))
+                
+                loss_penalty = self.empty_bead_penalty_weight * empty_bead_penalty
+                corrected_loss = corrected_loss + loss_penalty
+                errors['empty_bead_penalty'] = empty_bead_penalty
+                errors['empty_bead_loss'] = loss_penalty
+
             return corrected_loss, errors
 
         # Overwrite the tracked references
