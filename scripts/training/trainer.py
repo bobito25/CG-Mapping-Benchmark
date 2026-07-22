@@ -7,7 +7,7 @@ from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, use_direct_force_mapping=False, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
@@ -15,6 +15,9 @@ class CGForceMatching(ForceMatching):
         self.freeze_cg = freeze_cg
         self.empty_bead_penalty_weight = empty_bead_penalty_weight
         self.temperature = 1.0
+        self.use_direct_force_mapping = use_direct_force_mapping
+        self.epoch_cg_gradients = []
+        self.saved_cg_gradients = {}
         
         # Wrap update_fn of nbrs_init to stop gradients on position
         original_update_fn = nbrs_init.update_fn
@@ -73,10 +76,19 @@ class CGForceMatching(ForceMatching):
                 box=box_tensor, fractional_coordinates=False
             )
 
-            # Map AT -> CG for both R and F dynamically in Cartesian space
-            R_cg_cart, F_cg = jax.vmap(cg_map_single, in_axes=(0, None, None, 0, 0))(
-                (R_cart, batch['F']), shift_fn_cart, displacement_fn_cart, c_map, c_map
-            )
+            if self.use_direct_force_mapping:
+                # Map AT -> CG coordinates dynamically in Cartesian space
+                R_cg_cart, _ = jax.vmap(cg_map_single, in_axes=(0, None, None, 0, 0))(
+                    (R_cart, jnp.zeros_like(R_cart)), shift_fn_cart, displacement_fn_cart, c_map, c_map
+                )
+                # Map forces using assignments directly
+                assignments_t = jnp.swapaxes(assignments, -1, -2)
+                F_cg = jnp.einsum("BIn, Bnd -> BId", assignments_t, batch['F'])
+            else:
+                # Map AT -> CG for both R and F dynamically in Cartesian space
+                R_cg_cart, F_cg = jax.vmap(cg_map_single, in_axes=(0, None, None, 0, 0))(
+                    (R_cart, batch['F']), shift_fn_cart, displacement_fn_cart, c_map, c_map
+                )
             
             # Convert R_cg_cart back to fractional coordinates
             inv_box_tensor = jnp.linalg.inv(box_tensor)
@@ -158,6 +170,26 @@ class CGForceMatching(ForceMatching):
                 self.batched_model, self._loss_fn, optimizer, penalty_fn=kwargs.get('penalty_fn'))
             self._evaluate_fn = max_likelihood.shmap_loss_fn(
                 self.batched_model, self._loss_fn, penalty_fn=kwargs.get('penalty_fn'))
+
+        original_train_update_fn = self._update_fn
+        def wrapped_update_fn(params, opt_state, batch, per_target=True):
+            outputs = original_train_update_fn(params, opt_state, batch, per_target=per_target)
+            
+            # Extract gradients from outputs (index 3 is the gradient structure)
+            grad = outputs[3]
+            grad_cg = grad.get('cg_map', None)
+            if grad_cg is not None:
+                dense_keys = [k for k in grad_cg.keys() if 'Dense' in k]
+                if dense_keys:
+                    dense_grad = grad_cg[dense_keys[0]]
+                    kernel_grad = jax.device_get(dense_grad.get('kernel', 0.0))
+                    bias_grad = jax.device_get(dense_grad.get('bias', 0.0))
+                    self.epoch_cg_gradients.append({
+                        'kernel': kernel_grad,
+                        'bias': bias_grad
+                    })
+            return outputs
+        self._update_fn = wrapped_update_fn
 
     def _update(self, batch):
         # Inject current temperature into batch dictionary as a JAX array to prevent re-compilation

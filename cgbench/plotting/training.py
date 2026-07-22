@@ -241,3 +241,88 @@ def compare_atom_distances(
     plt.savefig(fname, dpi=300)
     plt.close(fig)
     return fname
+
+
+def plot_temperature_schedule(
+    gumbel_temp_choice: str | float,
+    epochs: int,
+    out_dir: str,
+    t_min: float = 0.1,
+    t_max: float = 1.0,
+    decay_rate: float = None,
+    threephase_points: list = None,
+    threephase_timings: list = None,
+) -> None:
+    """
+    Plot the Gumbel-Softmax temperature schedule and save to out_dir.
+
+    Parameters
+    ----------
+    gumbel_temp_choice : str or float
+        Gumbel temperature configuration: a number for constant temp or a string
+        for schedule ('exponential', 'linear', or '3phase')
+    epochs : int
+        Number of epochs to train
+    out_dir : str
+        Output directory to save the figure
+    t_min : float, optional
+        Minimum temperature for schedule (default: 0.1)
+    t_max : float, optional
+        Maximum/starting temperature for schedule (default: 1.0)
+    decay_rate : float, optional
+        Optional explicit exponential decay rate (default: None, solves automatically)
+    threephase_points : list of float, optional
+        4 temperature points for 3phase schedule (default: [1.0, 0.4, 0.3, 0.1])
+    threephase_timings : list of float, optional
+        2 timing fractions for middle points in 3phase schedule (default: [0.10, 0.90])
+    """
+    epochs_arr = np.arange(epochs)
+    temperatures = []
+
+    try:
+        gumbel_temp_val = float(gumbel_temp_choice)
+        temperatures = [gumbel_temp_val] * epochs
+    except (ValueError, TypeError):
+        t_start = t_max
+        gumbel_temp_choice_str = str(gumbel_temp_choice)
+        if gumbel_temp_choice_str == "exponential":
+            r_decay = decay_rate
+            if r_decay is None:
+                r_decay = (t_min / t_start) ** (1.0 / (epochs - 1)) if epochs > 1 else 1.0
+            for epoch in epochs_arr:
+                temperatures.append(max(t_min, t_start * (r_decay ** epoch)))
+        elif gumbel_temp_choice_str == "linear":
+            for epoch in epochs_arr:
+                temperatures.append(max(t_min, t_start - (t_start - t_min) * (epoch / (epochs - 1)) if epochs > 1 else 0.0))
+        elif gumbel_temp_choice_str == "3phase":
+            t0, t1, t2, t3 = threephase_points if threephase_points is not None else [1.0, 0.4, 0.3, 0.1]
+            f1, f2 = threephase_timings if threephase_timings is not None else [0.10, 0.90]
+            if epochs <= 1:
+                temperatures = [t0] * epochs
+            else:
+                e1 = f1 * (epochs - 1)
+                e2 = f2 * (epochs - 1)
+                e3 = epochs - 1
+                for epoch in epochs_arr:
+                    if epoch <= e1:
+                        val = t0 + (t1 - t0) * (epoch / e1) if e1 > 0 else t1
+                    elif epoch <= e2:
+                        val = t1 + (t2 - t1) * ((epoch - e1) / (e2 - e1)) if e2 > e1 else t2
+                    else:
+                        val = t2 + (t3 - t2) * ((epoch - e2) / (e3 - e2)) if e3 > e2 else t3
+                    temperatures.append(val)
+        else:
+            raise ValueError(f"Unknown Gumbel temperature schedule: {gumbel_temp_choice}")
+
+    fig, ax = plt.subplots(1, 1, figsize=(5.5, 4), layout="constrained")
+    ax.plot(epochs_arr, temperatures, marker="o", markersize=4, color="#C92D39", linewidth=2.0)
+    ax.set_title("Gumbel-Softmax Temperature Schedule")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Temperature")
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(f"{out_dir}/gumbel_temperature_schedule.png", bbox_inches="tight", dpi=300)
+    plt.close(fig)
+

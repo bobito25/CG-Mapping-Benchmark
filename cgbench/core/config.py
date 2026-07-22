@@ -59,6 +59,11 @@ DEFAULT_TRAIN_CONFIG = {
     "optimizer": "adam+decay",
     "cg_save_freq": 1,
     "gumbel_temp": 0.0,
+    "gumbel_temp_min": 0.1,
+    "gumbel_temp_max": 1.0,
+    "gumbel_decay_rate": None,
+    "gumbel_temp_3phase_points": [1.0, 0.4, 0.25, 0.1],
+    "gumbel_temp_3phase_timings": [0.10, 0.90],
     "empty_bead_penalty_weight": 1000000.0,
 }
 

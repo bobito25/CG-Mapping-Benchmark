@@ -33,15 +33,64 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument(
+    "--gumbel-temp-min",
+    type=float,
+    help="Minimum temperature for Gumbel schedule",
+    default=None,
+)
+parser.add_argument(
+    "--gumbel-temp-max",
+    type=float,
+    help="Maximum/starting temperature for Gumbel schedule",
+    default=None,
+)
+parser.add_argument(
+    "--gumbel-decay-rate",
+    type=float,
+    help="Decay rate multiplier per epoch for exponential Gumbel schedule (overrides auto decay)",
+    default=None,
+)
+parser.add_argument(
     "--epochs",
     type=int,
     help="Number of epochs to train",
     default=None,
 )
+parser.add_argument(
+    "--use-direct-force-mapping",
+    action="store_true",
+    help="Use direct force mapping with assignments instead of coordinate map weights",
+)
+parser.add_argument(
+    "--gumbel-temp-3phase-points",
+    type=float,
+    nargs=4,
+    help="4 temperature points for 3phase schedule",
+    default=None,
+)
+parser.add_argument(
+    "--gumbel-temp-3phase-timings",
+    type=float,
+    nargs=2,
+    help="2 timing fractions for middle points in 3phase schedule",
+    default=None,
+)
+parser.add_argument(
+    "--label",
+    type=str,
+    help="Optional label to append to training output results directory name",
+    default=None,
+)
+parser.add_argument(
+    "--unique-cg-species",
+    action="store_true",
+    help="Use a unique species for each coarse-grained bead instead of sharing species from the heuristic map.",
+)
 args = parser.parse_args()
 
-if args.device:
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
+device_choice = args.device or os.environ.get("GPU_CHOICE")
+if device_choice:
+    os.environ["CUDA_VISIBLE_DEVICES"] = device_choice
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.97"
 
 import jax
@@ -69,11 +118,25 @@ MACE_CONFIG["CG_map"] = cg_map_choice
 MACE_CONFIG["use_bond_priors"] = args.prior
 MACE_CONFIG["type"] = "CG" if MACE_CONFIG["CG_map"] != "AT" else "AT"
 MACE_CONFIG["freeze_cg"] = args.freeze_cg or MACE_CONFIG.get("freeze_cg", False)
+MACE_CONFIG["unique_cg_species"] = args.unique_cg_species or MACE_CONFIG.get("unique_cg_species", False)
 
 gumbel_temp_choice = args.gumbel_temp
 if gumbel_temp_choice is None:
     gumbel_temp_choice = TRAIN_CONFIG.get("gumbel_temp", "exponential")
 TRAIN_CONFIG["gumbel_temp"] = gumbel_temp_choice
+
+if args.gumbel_temp_min is not None:
+    TRAIN_CONFIG["gumbel_temp_min"] = args.gumbel_temp_min
+if args.gumbel_temp_max is not None:
+    TRAIN_CONFIG["gumbel_temp_max"] = args.gumbel_temp_max
+if args.gumbel_decay_rate is not None:
+    TRAIN_CONFIG["gumbel_decay_rate"] = args.gumbel_decay_rate
+
+if args.gumbel_temp_3phase_points is not None:
+    TRAIN_CONFIG["gumbel_temp_3phase_points"] = args.gumbel_temp_3phase_points
+if args.gumbel_temp_3phase_timings is not None:
+    TRAIN_CONFIG["gumbel_temp_3phase_timings"] = args.gumbel_temp_3phase_timings
+
 if args.epochs is not None:
     TRAIN_CONFIG["num_epochs"] = args.epochs
 if MACE_CONFIG["freeze_cg"] and MACE_CONFIG["CG_map"] != "learned":
@@ -130,13 +193,36 @@ else:
 if MACE_CONFIG["CG_map"] == "learned":
     freeze_suffix = f"_freezecg={MACE_CONFIG['freeze_cg']}"
     gumbel_temp_suffix = f"_gumbeltemp={TRAIN_CONFIG['gumbel_temp']}"
+    direct_force_map_suffix = f"_directforcemap={args.use_direct_force_mapping}"
+    unique_species_suffix = f"_uniquespecies={MACE_CONFIG['unique_cg_species']}"
     print("[INFO] Gumbel temperature: ", TRAIN_CONFIG["gumbel_temp"])
 else:
     freeze_suffix = ""
     gumbel_temp_suffix = ""
+    direct_force_map_suffix = ""
+    unique_species_suffix = ""
 
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}"
+label_suffix = f"_{args.label}" if args.label is not None else ""
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{unique_species_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
 os.makedirs(output_dir, exist_ok=True)
+
+if MACE_CONFIG["CG_map"] == "learned":
+    try:
+        from cgbench.plotting.training import plot_temperature_schedule
+        plot_temperature_schedule(
+            gumbel_temp_choice=TRAIN_CONFIG["gumbel_temp"],
+            epochs=TRAIN_CONFIG["num_epochs"],
+            out_dir=output_dir,
+            t_min=TRAIN_CONFIG["gumbel_temp_min"],
+            t_max=TRAIN_CONFIG["gumbel_temp_max"],
+            decay_rate=TRAIN_CONFIG.get("gumbel_decay_rate"),
+            threephase_points=TRAIN_CONFIG.get("gumbel_temp_3phase_points"),
+            threephase_timings=TRAIN_CONFIG.get("gumbel_temp_3phase_timings"),
+        )
+        print(f"[INFO] Saved temperature schedule plot to {output_dir}/gumbel_temperature_schedule.png")
+    except Exception as e:
+        print(f"[WARNING] Could not plot temperature schedule: {e}")
+
 
 # -------------------------
 # Setup neighbor list and MACE model
@@ -180,6 +266,8 @@ if MACE_CONFIG["type"] == "CG":
                 if target_map_name in map_inst.get_available_maps():
                     indices, cg_species, _, _ = map_inst.get_map(target_map_name)
                     num_cg_beads = len(cg_species)
+                    if MACE_CONFIG.get("unique_cg_species", False):
+                        cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
                     indices_clean = [idx if idx >= 0 else 0 for idx in indices]
                     initial_mapping = tuple(indices_clean)
                     if MACE_CONFIG["CG_map"] == "learned":
@@ -190,6 +278,8 @@ if MACE_CONFIG["type"] == "CG":
                     print(f"[INFO] Using CG species: {cg_species}")
                 else:
                     print(f"[WARNING] No map found. Using default 10 beads. CG species will default to all zeros.")
+                    if MACE_CONFIG.get("unique_cg_species", False):
+                        cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
             except Exception as e:
                 print(f"[WARNING] Error reading heuristic map for initialization: {e}")
 
@@ -434,7 +524,8 @@ if MACE_CONFIG["CG_map"] == "learned":
         cg_species=cg_species,
         atom_masses=masses,
         freeze_cg=MACE_CONFIG["freeze_cg"],
-        empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0)
+        empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0),
+        use_direct_force_mapping=args.use_direct_force_mapping
     )
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}
@@ -478,6 +569,22 @@ if MACE_CONFIG["CG_map"] == "learned":
                     print("CG Beads to Atoms:")
                     for bead_idx in sorted(bead_to_atoms.keys()):
                         print(f"  Bead {bead_idx}: Atoms {bead_to_atoms[bead_idx]}")
+                    
+                    # Calculate and save mean gradients for this epoch
+                    if hasattr(trainer, "epoch_cg_gradients") and trainer.epoch_cg_gradients:
+                        mean_kernel_grad = onp.mean([g['kernel'] for g in trainer.epoch_cg_gradients], axis=0)
+                        mean_bias_grad = onp.mean([g['bias'] for g in trainer.epoch_cg_gradients], axis=0)
+                        
+                        if not hasattr(trainer, "saved_cg_gradients"):
+                            trainer.saved_cg_gradients = {}
+                        
+                        if epoch % cg_save_freq == 0 or epoch == epochs - 1:
+                            trainer.saved_cg_gradients[int(epoch)] = {
+                                'kernel': mean_kernel_grad.tolist(),
+                                'bias': mean_bias_grad.tolist()
+                            }
+                        trainer.epoch_cg_gradients = []
+                        
                     print("-------------------------------------------\n", flush=True)
 
     def update_gumbel_temperature(trainer, *args, **kwargs):
@@ -488,13 +595,32 @@ if MACE_CONFIG["CG_map"] == "learned":
             if epoch == 0:
                 print(f"[INFO] Gumbel-Softmax temperature set to constant {trainer.temperature:.4f}")
         except ValueError:
-            t_start = 1.0
-            t_min = 0.1
+            t_start = TRAIN_CONFIG.get("gumbel_temp_max", 1.0)
+            t_min = TRAIN_CONFIG.get("gumbel_temp_min", 0.1)
             if gumbel_temp_choice == "exponential":
-                decay_rate = (t_min / t_start) ** (1.0 / (epochs - 1)) if epochs > 1 else 1.0
+                decay_rate = TRAIN_CONFIG.get("gumbel_decay_rate")
+                if decay_rate is None:
+                    decay_rate = (t_min / t_start) ** (1.0 / (epochs - 1)) if epochs > 1 else 1.0
                 trainer.temperature = max(t_min, t_start * (decay_rate ** epoch))
             elif gumbel_temp_choice == "linear":
                 trainer.temperature = max(t_min, t_start - (t_start - t_min) * (epoch / (epochs - 1)) if epochs > 1 else 0.0)
+            elif gumbel_temp_choice == "3phase":
+                t_pts = TRAIN_CONFIG.get("gumbel_temp_3phase_points", [1.0, 0.4, 0.3, 0.1])
+                t_tms = TRAIN_CONFIG.get("gumbel_temp_3phase_timings", [0.10, 0.90])
+                t0, t1, t2, t3 = t_pts
+                f1, f2 = t_tms
+                if epochs <= 1:
+                    trainer.temperature = t0
+                else:
+                    e1 = f1 * (epochs - 1)
+                    e2 = f2 * (epochs - 1)
+                    e3 = epochs - 1
+                    if epoch <= e1:
+                        trainer.temperature = t0 + (t1 - t0) * (epoch / e1) if e1 > 0 else t1
+                    elif epoch <= e2:
+                        trainer.temperature = t1 + (t2 - t1) * ((epoch - e1) / (e2 - e1)) if e2 > e1 else t2
+                    else:
+                        trainer.temperature = t2 + (t3 - t2) * ((epoch - e2) / (e3 - e2)) if e3 > e2 else t3
             else:
                 raise ValueError(f"Unknown Gumbel temperature schedule: {gumbel_temp_choice}")
             print(f"[INFO] Gumbel-Softmax temperature set to {trainer.temperature:.4f} for Epoch {epoch}")
@@ -539,6 +665,20 @@ if MACE_CONFIG["CG_map"] == "learned":
     with open(cg_maps_path, "w") as f:
         json.dump(trainer_fm.saved_cg_maps, f, indent=4)
     print(f"[INFO] Saved CG maps to {cg_maps_path}")
+
+    # Save cg gradients to json
+    cg_grads_path = f"{output_dir}/cg_gradients.json"
+    with open(cg_grads_path, "w") as f:
+        json.dump(trainer_fm.saved_cg_gradients, f, indent=4)
+    print(f"[INFO] Saved CG gradients to {cg_grads_path}")
+
+    # Generate gradient visualization and grid plot automatically
+    try:
+        import subprocess
+        viz_script = os.path.join(os.path.dirname(__file__), "visualize_cg_gradients.py")
+        subprocess.run([sys.executable, viz_script, cg_grads_path], check=True)
+    except Exception as e:
+        print(f"[WARNING] Could not automatically generate gradient visualization: {e}")
 
     # Create visualization of CG maps over time
     try:

@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gumbel-Softmax Temperature Schedule Visualizer</title>
+    <!-- Outfit Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-color: #0b0813;
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --primary: #8b5cf6;
+            --secondary: #06b6d4;
+            --text-color: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: radial-gradient(circle at 50% 0%, #1e1145, var(--bg-color));
+            color: var(--text-color);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+            overflow-x: hidden;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 2.5rem;
+            animation: fadeIn 1s ease-out;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+            letter-spacing: -0.025em;
+        }
+
+        header p {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+            font-weight: 300;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 380px 1fr;
+            gap: 2rem;
+            width: 100%;
+            max-width: 1200px;
+            animation: slideUp 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            box-shadow: 0 15px 40px rgba(139, 92, 246, 0.1);
+        }
+
+        .controls-card {
+            display: flex;
+            flex-direction: column;
+            gap: 1.8rem;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+
+        .control-label {
+            font-size: 0.9rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .value-display {
+            font-size: 1.1rem;
+            color: var(--secondary);
+            font-weight: 700;
+            background: rgba(6, 182, 212, 0.1);
+            padding: 2px 8px;
+            border-radius: 6px;
+        }
+
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+            color: var(--text-color);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .checkbox-container input {
+            cursor: pointer;
+            accent-color: var(--primary);
+            width: 16px;
+            height: 16px;
+        }
+
+        /* Range Slider Styling */
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 5px;
+            outline: none;
+            transition: background 0.3s;
+        }
+
+        input[type="range"]:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--secondary);
+            cursor: pointer;
+            box-shadow: 0 0 10px var(--secondary);
+            transition: transform 0.1s, background-color 0.2s;
+        }
+
+        input[type="range"]:disabled::-webkit-slider-thumb {
+            background: var(--text-muted);
+            box-shadow: none;
+            cursor: not-allowed;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover:not(:disabled) {
+            transform: scale(1.2);
+            background: var(--primary);
+            box-shadow: 0 0 15px var(--primary);
+        }
+
+        /* Select Styling */
+        select {
+            width: 100%;
+            padding: 0.8rem 1rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            color: var(--text-color);
+            font-family: inherit;
+            font-size: 1rem;
+            outline: none;
+            cursor: pointer;
+            transition: border-color 0.3s, background 0.3s;
+        }
+
+        select:focus {
+            border-color: var(--primary);
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .chart-card {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            position: relative;
+            min-height: 450px;
+        }
+
+        .formula-card {
+            grid-column: 1 / -1;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .formula-card h3 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--text-color);
+        }
+
+        .formula-box {
+            font-family: monospace;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 1rem;
+            border-radius: 10px;
+            border-left: 4px solid var(--primary);
+            overflow-x: auto;
+            font-size: 0.95rem;
+            color: #a78bfa;
+            line-height: 1.5;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 900px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Temperature Schedule Visualizer</h1>
+        <p>Explore and optimize your Gumbel-Softmax decay schedules interactively</p>
+    </header>
+
+    <div class="container">
+        <!-- Controls Sidebar -->
+        <div class="card controls-card">
+            <div class="control-group">
+                <span class="control-label">
+                    Schedule Type
+                </span>
+                <select id="schedule-type">
+                    <option value="exponential">Exponential Decay</option>
+                    <option value="linear">Linear Decay</option>
+                    <option value="3phase">3-Phase Schedule</option>
+                </select>
+            </div>
+
+            <div class="control-group" id="standard-max-group">
+                <span class="control-label">
+                    Max Temp (Start)
+                    <span id="max-val" class="value-display">1.00</span>
+                </span>
+                <input type="range" id="temp-max" min="0.1" max="5.0" step="0.05" value="1.0">
+            </div>
+
+            <div class="control-group" id="standard-min-group">
+                <span class="control-label">
+                    Min Temp (End)
+                    <span id="min-val" class="value-display">0.10</span>
+                </span>
+                <input type="range" id="temp-min" min="0.01" max="1.0" step="0.01" value="0.1">
+            </div>
+
+            <!-- 3-Phase specific controls -->
+            <div id="threephase-group" style="display: none; flex-direction: column; gap: 1.8rem; width: 100%;">
+                <div class="control-group">
+                    <span class="control-label">
+                        T0 (Start Temp)
+                        <span id="t0-val" class="value-display">1.00</span>
+                    </span>
+                    <input type="range" id="t0" min="0.1" max="5.0" step="0.05" value="1.0">
+                </div>
+                <div class="control-group">
+                    <span class="control-label">
+                        T1 (Mid-1 Temp)
+                        <span id="t1-val" class="value-display">0.40</span>
+                    </span>
+                    <input type="range" id="t1" min="0.01" max="5.0" step="0.05" value="0.4">
+                </div>
+                <div class="control-group">
+                    <span class="control-label">
+                        T2 (Mid-2 Temp)
+                        <span id="t2-val" class="value-display">0.30</span>
+                    </span>
+                    <input type="range" id="t2" min="0.01" max="5.0" step="0.05" value="0.3">
+                </div>
+                <div class="control-group">
+                    <span class="control-label">
+                        T3 (End Temp)
+                        <span id="t3-val" class="value-display">0.10</span>
+                    </span>
+                    <input type="range" id="t3" min="0.01" max="5.0" step="0.05" value="0.1">
+                </div>
+                <div class="control-group">
+                    <span class="control-label">
+                        Mid-1 Timing
+                        <span id="f1-val" class="value-display">10%</span>
+                    </span>
+                    <input type="range" id="f1" min="0" max="100" step="1" value="10">
+                </div>
+                <div class="control-group">
+                    <span class="control-label">
+                        Mid-2 Timing
+                        <span id="f2-val" class="value-display">90%</span>
+                    </span>
+                    <input type="range" id="f2" min="0" max="100" step="1" value="90">
+                </div>
+            </div>
+
+            <div class="control-group">
+                <span class="control-label">
+                    Number of Epochs
+                    <span id="epochs-val" class="value-display">100</span>
+                </span>
+                <input type="range" id="epochs" min="5" max="300" step="5" value="100">
+            </div>
+
+            <div class="control-group" id="auto-decay-group">
+                <label class="checkbox-container">
+                    <input type="checkbox" id="auto-decay" checked>
+                    <span>Auto decay (solve from final epoch)</span>
+                </label>
+            </div>
+
+            <div class="control-group" id="manual-decay-group">
+                <span class="control-label">
+                    Decay Rate (Multiplier)
+                    <span id="decay-val" class="value-display">0.950</span>
+                </span>
+                <input type="range" id="decay-rate" min="0.80" max="0.999" step="0.001" value="0.95">
+            </div>
+        </div>
+
+        <!-- Chart Container -->
+        <div class="card chart-card">
+            <canvas id="scheduleChart"></canvas>
+        </div>
+
+        <!-- Formula and Logic Info -->
+        <div class="card formula-card">
+            <h3>Decay Math & Parameters</h3>
+            <div id="formula-display" class="formula-box">
+                // Exponential decay calculation
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const scheduleTypeInput = document.getElementById('schedule-type');
+        const tempMaxInput = document.getElementById('temp-max');
+        const tempMinInput = document.getElementById('temp-min');
+        const epochsInput = document.getElementById('epochs');
+        const autoDecayInput = document.getElementById('auto-decay');
+        const decayRateInput = document.getElementById('decay-rate');
+
+        // 3-Phase Inputs
+        const t0Input = document.getElementById('t0');
+        const t1Input = document.getElementById('t1');
+        const t2Input = document.getElementById('t2');
+        const t3Input = document.getElementById('t3');
+        const f1Input = document.getElementById('f1');
+        const f2Input = document.getElementById('f2');
+
+        const maxValDisplay = document.getElementById('max-val');
+        const minValDisplay = document.getElementById('min-val');
+        const epochsValDisplay = document.getElementById('epochs-val');
+        const decayValDisplay = document.getElementById('decay-val');
+        
+        // 3-Phase Displays
+        const t0ValDisplay = document.getElementById('t0-val');
+        const t1ValDisplay = document.getElementById('t1-val');
+        const t2ValDisplay = document.getElementById('t2-val');
+        const t3ValDisplay = document.getElementById('t3-val');
+        const f1ValDisplay = document.getElementById('f1-val');
+        const f2ValDisplay = document.getElementById('f2-val');
+
+        const formulaDisplay = document.getElementById('formula-display');
+
+        const standardMaxGroup = document.getElementById('standard-max-group');
+        const standardMinGroup = document.getElementById('standard-min-group');
+        const threephaseGroup = document.getElementById('threephase-group');
+        const autoDecayGroup = document.getElementById('auto-decay-group');
+        const manualDecayGroup = document.getElementById('manual-decay-group');
+
+        let chart;
+
+        function updateDisplays() {
+            maxValDisplay.textContent = parseFloat(tempMaxInput.value).toFixed(2);
+            minValDisplay.textContent = parseFloat(tempMinInput.value).toFixed(2);
+            epochsValDisplay.textContent = parseInt(epochsInput.value);
+            decayValDisplay.textContent = parseFloat(decayRateInput.value).toFixed(3);
+
+            t0ValDisplay.textContent = parseFloat(t0Input.value).toFixed(2);
+            t1ValDisplay.textContent = parseFloat(t1Input.value).toFixed(2);
+            t2ValDisplay.textContent = parseFloat(t2Input.value).toFixed(2);
+            t3ValDisplay.textContent = parseFloat(t3Input.value).toFixed(2);
+
+            // Validate timings
+            let pct1 = parseInt(f1Input.value);
+            let pct2 = parseInt(f2Input.value);
+            if (pct1 >= pct2) {
+                pct1 = Math.max(0, pct2 - 1);
+                f1Input.value = pct1;
+            }
+            f1ValDisplay.textContent = pct1 + "%";
+            f2ValDisplay.textContent = pct2 + "%";
+
+            // Ensure min temperature does not exceed max temperature
+            if (parseFloat(tempMinInput.value) >= parseFloat(tempMaxInput.value)) {
+                tempMinInput.value = (parseFloat(tempMaxInput.value) - 0.05).toFixed(2);
+                minValDisplay.textContent = parseFloat(tempMinInput.value).toFixed(2);
+            }
+
+            const type = scheduleTypeInput.value;
+            if (type === 'exponential') {
+                standardMaxGroup.style.display = 'block';
+                standardMinGroup.style.display = 'block';
+                threephaseGroup.style.display = 'none';
+                autoDecayGroup.style.display = 'block';
+                manualDecayGroup.style.display = 'block';
+                if (autoDecayInput.checked) {
+                    decayRateInput.disabled = true;
+                    manualDecayGroup.style.opacity = 0.5;
+                } else {
+                    decayRateInput.disabled = false;
+                    manualDecayGroup.style.opacity = 1.0;
+                }
+            } else if (type === 'linear') {
+                standardMaxGroup.style.display = 'block';
+                standardMinGroup.style.display = 'block';
+                threephaseGroup.style.display = 'none';
+                autoDecayGroup.style.display = 'none';
+                manualDecayGroup.style.display = 'none';
+            } else if (type === '3phase') {
+                standardMaxGroup.style.display = 'none';
+                standardMinGroup.style.display = 'none';
+                threephaseGroup.style.display = 'flex';
+                autoDecayGroup.style.display = 'none';
+                manualDecayGroup.style.display = 'none';
+            }
+        }
+
+        function calculateSchedule(type, epochs, tStart, tMin, autoDecay, customDecay, t0, t1, t2, t3, f1, f2) {
+            const epochsArr = Array.from({length: epochs}, (_, i) => i);
+            const temperatures = [];
+            
+            if (type === 'exponential') {
+                let decayRate;
+                if (autoDecay) {
+                    decayRate = epochs > 1 ? Math.pow(tMin / tStart, 1.0 / (epochs - 1)) : 1.0;
+                } else {
+                    decayRate = customDecay;
+                }
+                for (let epoch of epochsArr) {
+                    temperatures.push(Math.max(tMin, tStart * Math.pow(decayRate, epoch)));
+                }
+            } else if (type === 'linear') {
+                for (let epoch of epochsArr) {
+                    temperatures.push(Math.max(tMin, tStart - (tStart - tMin) * (epochs > 1 ? (epoch / (epochs - 1)) : 0.0)));
+                }
+            } else if (type === '3phase') {
+                if (epochs <= 1) {
+                    return { epochsArr, temperatures: [t0] };
+                }
+                const e1 = f1 * (epochs - 1);
+                const e2 = f2 * (epochs - 1);
+                const e3 = epochs - 1;
+                for (let epoch of epochsArr) {
+                    if (epoch <= e1) {
+                        temperatures.push(t0 + (t1 - t0) * (epoch / e1));
+                    } else if (epoch <= e2) {
+                        temperatures.push(t1 + (t2 - t1) * ((epoch - e1) / (e2 - e1)));
+                    } else {
+                        temperatures.push(t2 + (t3 - t2) * ((epoch - e2) / (e3 - e2)));
+                    }
+                }
+            }
+            return { epochsArr, temperatures };
+        }
+
+        function updateFormulaText(type, tStart, tMin, epochs, autoDecay, customDecay, t0, t1, t2, t3, f1, f2) {
+            if (type === 'exponential') {
+                let decayRate;
+                let autoText = "";
+                if (autoDecay) {
+                    decayRate = epochs > 1 ? Math.pow(tMin / tStart, 1.0 / (epochs - 1)) : 1.0;
+                    autoText = `// Auto Solved decay rate based on final epoch:\n`;
+                } else {
+                    decayRate = customDecay;
+                    autoText = `// Custom explicit decay rate:\n`;
+                }
+                formulaDisplay.innerHTML = autoText +
+                    `decay_rate = ${decayRate.toFixed(4)}\n` +
+                    `temperature = max(${tMin.toFixed(3)}, ${tStart.toFixed(3)} * (${decayRate.toFixed(4)} ^ epoch))`;
+            } else if (type === 'linear') {
+                formulaDisplay.innerHTML = `// Linear Decay Formula:\n` +
+                    `step_size = (${tStart.toFixed(3)} - ${tMin.toFixed(3)}) / ${epochs - 1} = ${((tStart - tMin) / (epochs - 1)).toFixed(4)}\n` +
+                    `temperature = max(${tMin.toFixed(3)}, ${tStart.toFixed(3)} - ${((tStart - tMin) / (epochs - 1)).toFixed(4)} * epoch)`;
+            } else if (type === '3phase') {
+                const e1 = (f1 * (epochs - 1)).toFixed(1);
+                const e2 = (f2 * (epochs - 1)).toFixed(1);
+                formulaDisplay.innerHTML = `// 3-Phase Linear Schedule Formula:\n` +
+                    `Transition epochs: E1 = ${e1} (Epoch ${Math.round(e1)}), E2 = ${e2} (Epoch ${Math.round(e2)})\n` +
+                    `Phase 1 (Epoch <= E1): Interpolate ${t0.toFixed(2)} to ${t1.toFixed(2)}\n` +
+                    `Phase 2 (E1 < Epoch <= E2): Interpolate ${t1.toFixed(2)} to ${t2.toFixed(2)}\n` +
+                    `Phase 3 (E2 < Epoch): Interpolate ${t2.toFixed(2)} to ${t3.toFixed(2)}`;
+            }
+        }
+
+        function updateChart() {
+            updateDisplays();
+
+            const type = scheduleTypeInput.value;
+            const tStart = parseFloat(tempMaxInput.value);
+            const tMin = parseFloat(tempMinInput.value);
+            const epochs = parseInt(epochsInput.value);
+            const autoDecay = autoDecayInput.checked;
+            const customDecay = parseFloat(decayRateInput.value);
+
+            // 3-Phase Specific variables
+            const t0 = parseFloat(t0Input.value);
+            const t1 = parseFloat(t1Input.value);
+            const t2 = parseFloat(t2Input.value);
+            const t3 = parseFloat(t3Input.value);
+            const f1 = parseFloat(f1Input.value) / 100.0;
+            const f2 = parseFloat(f2Input.value) / 100.0;
+
+            const { epochsArr, temperatures } = calculateSchedule(type, epochs, tStart, tMin, autoDecay, customDecay, t0, t1, t2, t3, f1, f2);
+            updateFormulaText(type, tStart, tMin, epochs, autoDecay, customDecay, t0, t1, t2, t3, f1, f2);
+
+            const ctx = document.getElementById('scheduleChart').getContext('2d');
+            const maxValLimit = type === '3phase' ? Math.max(t0, t1, t2, t3) : tStart;
+
+            if (chart) {
+                chart.data.labels = epochsArr;
+                chart.data.datasets[0].data = temperatures;
+                chart.data.datasets[0].label = `${type.charAt(0).toUpperCase() + type.slice(1)} Schedule`;
+                chart.options.scales.x.max = epochs - 1;
+                chart.options.scales.y.max = Math.ceil(maxValLimit * 1.1);
+                chart.update('none');
+            } else {
+                const gradient = ctx.createLinearGradient(0, 0, 0, 400);
+                gradient.addColorStop(0, 'rgba(139, 92, 246, 0.4)');
+                gradient.addColorStop(1, 'rgba(6, 182, 212, 0.02)');
+
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: epochsArr,
+                        datasets: [{
+                            label: `${type.charAt(0).toUpperCase() + type.slice(1)} Schedule`,
+                            data: temperatures,
+                            borderColor: '#8b5cf6',
+                            borderWidth: 3,
+                            pointBackgroundColor: '#06b6d4',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 1,
+                            pointRadius: (context) => {
+                                const index = context.dataIndex;
+                                const count = context.dataset.data.length;
+                                return (count <= 50 || index % 5 === 0) ? 3 : 0;
+                            },
+                            pointHoverRadius: 6,
+                            fill: true,
+                            backgroundColor: gradient,
+                            tension: 0.1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                labels: {
+                                    color: '#f3f4f6',
+                                    font: {
+                                        family: 'Outfit',
+                                        size: 14
+                                    }
+                                }
+                            },
+                            tooltip: {
+                                callbacks: {
+                                    title: (items) => `Epoch ${items[0].label}`,
+                                    label: (item) => ` Temperature: ${parseFloat(item.raw).toFixed(4)}`
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                grid: {
+                                    color: 'rgba(255, 255, 255, 0.05)'
+                                },
+                                ticks: {
+                                    color: '#9ca3af',
+                                    font: {
+                                        family: 'Outfit'
+                                    }
+                                },
+                                title: {
+                                    display: true,
+                                    text: 'Epoch',
+                                    color: '#f3f4f6',
+                                    font: {
+                                        family: 'Outfit',
+                                        size: 14,
+                                        weight: '600'
+                                    }
+                                }
+                            },
+                            y: {
+                                grid: {
+                                    color: 'rgba(255, 255, 255, 0.05)'
+                                },
+                                ticks: {
+                                    color: '#9ca3af',
+                                    font: {
+                                        family: 'Outfit'
+                                    }
+                                },
+                                title: {
+                                    display: true,
+                                    text: 'Temperature',
+                                    color: '#f3f4f6',
+                                    font: {
+                                        family: 'Outfit',
+                                        size: 14,
+                                        weight: '600'
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Add event listeners
+        scheduleTypeInput.addEventListener('change', updateChart);
+        tempMaxInput.addEventListener('input', updateChart);
+        tempMinInput.addEventListener('input', updateChart);
+        epochsInput.addEventListener('input', updateChart);
+        autoDecayInput.addEventListener('change', updateChart);
+        decayRateInput.addEventListener('input', updateChart);
+
+        // 3-Phase Listeners
+        t0Input.addEventListener('input', updateChart);
+        t1Input.addEventListener('input', updateChart);
+        t2Input.addEventListener('input', updateChart);
+        t3Input.addEventListener('input', updateChart);
+        f1Input.addEventListener('input', updateChart);
+        f2Input.addEventListener('input', updateChart);
+
+        // Initial render
+        updateChart();
+    </script>
+</body>
+</html>
