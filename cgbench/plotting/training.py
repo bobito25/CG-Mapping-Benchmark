@@ -326,3 +326,321 @@ def plot_temperature_schedule(
     fig.savefig(f"{out_dir}/gumbel_temperature_schedule.png", bbox_inches="tight", dpi=300)
     plt.close(fig)
 
+
+ATOMIC_NUMBER_TO_SYMBOL = {
+    1: "H",
+    2: "He",
+    3: "Li",
+    4: "Be",
+    5: "B",
+    6: "C",
+    7: "N",
+    8: "O",
+    9: "F",
+    10: "Ne",
+    11: "Na",
+    12: "Mg",
+    13: "Al",
+    14: "Si",
+    15: "P",
+    16: "S",
+    17: "Cl",
+    35: "Br",
+    53: "I",
+}
+
+
+def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None:
+    """
+    Plot a visualization grid of learned atom type embeddings over time/epochs.
+
+    Parameters
+    ----------
+    saved_atom_embeddings : dict
+        Dictionary mapping epoch (int) to dict of {atom_type_species (int or str): embedding_vector (list or ndarray)}
+    out_dir : str
+        Output directory to save the figure
+    """
+    if not saved_atom_embeddings:
+        return
+
+    epochs = sorted([int(e) for e in saved_atom_embeddings.keys()])
+    num_epochs = len(epochs)
+    if num_epochs == 0:
+        return
+
+    first_epoch_data = saved_atom_embeddings[epochs[0]]
+    species_keys = sorted([int(k) for k in first_epoch_data.keys()])
+    num_atom_types = len(species_keys)
+
+    species_labels = [
+        ATOMIC_NUMBER_TO_SYMBOL.get(s, f"Species_{s}") for s in species_keys
+    ]
+
+    emb_dim = len(first_epoch_data[species_keys[0]])
+    data_matrix = np.zeros((num_epochs, num_atom_types, emb_dim))
+
+    for i, ep in enumerate(epochs):
+        ep_dict = saved_atom_embeddings[ep]
+        for j, spec in enumerate(species_keys):
+            vec = ep_dict.get(spec) if spec in ep_dict else ep_dict.get(str(spec))
+            if vec is not None:
+                data_matrix[i, j, :] = np.array(vec)
+
+    cols = min(4, num_epochs)
+    rows = int(np.ceil(num_epochs / cols))
+
+    fig = plt.figure(figsize=(4 * cols + 2, 3.5 * (rows + 1)), layout="constrained")
+    fig.suptitle("Learned Atom-Type Embeddings Over Training Epochs", fontsize=16, fontweight="bold")
+
+    gs = fig.add_gridspec(rows + 1, cols)
+
+    vmin, vmax = data_matrix.min(), data_matrix.max()
+    im = None
+
+    for i, ep in enumerate(epochs):
+        r, c = i // cols, i % cols
+        ax = fig.add_subplot(gs[r, c])
+        im = ax.imshow(
+            data_matrix[i],
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_title(f"Epoch {ep}", fontsize=11)
+        ax.set_yticks(np.arange(num_atom_types))
+        ax.set_yticklabels(species_labels)
+        ax.set_xlabel("Embedding Dim")
+        if c == 0:
+            ax.set_ylabel("Atom Type")
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=fig.axes[:num_epochs], shrink=0.8, location="right")
+        cbar.set_label("Embedding Value")
+
+    flat_matrix = data_matrix.reshape(-1, emb_dim)
+    ax_pca_cols = max(1, cols // 2)
+    ax_pca = fig.add_subplot(gs[rows, :ax_pca_cols])
+    ax_norm = fig.add_subplot(gs[rows, ax_pca_cols:])
+
+    if emb_dim >= 2:
+        try:
+            mean_vec = flat_matrix.mean(axis=0)
+            centered = flat_matrix - mean_vec
+            u, s, vh = np.linalg.svd(centered, full_matrices=False)
+            proj = centered @ vh[:2].T
+            proj = proj.reshape(num_epochs, num_atom_types, 2)
+
+            colors = plt.cm.Set1(np.linspace(0, 1, max(1, num_atom_types)))
+            for j in range(num_atom_types):
+                traj = proj[:, j, :]
+                ax_pca.plot(traj[:, 0], traj[:, 1], "o-", color=colors[j], label=species_labels[j], alpha=0.8)
+                ax_pca.scatter(traj[0, 0], traj[0, 1], color=colors[j], s=80, marker="s", edgecolors="black")
+                ax_pca.scatter(traj[-1, 0], traj[-1, 1], color=colors[j], s=120, marker="*", edgecolors="black")
+
+            ax_pca.set_title("Atom Embedding Trajectory (2D PCA)")
+            ax_pca.set_xlabel("PC 1")
+            ax_pca.set_ylabel("PC 2")
+            ax_pca.legend()
+        except Exception:
+            ax_pca.text(0.5, 0.5, "PCA plot unavailable", ha="center", va="center")
+    else:
+        ax_pca.text(0.5, 0.5, "Embedding dim < 2", ha="center", va="center")
+
+    norms = np.linalg.norm(data_matrix, axis=-1)
+    colors = plt.cm.Set1(np.linspace(0, 1, max(1, num_atom_types)))
+    for j in range(num_atom_types):
+        ax_norm.plot(epochs, norms[:, j], "o-", color=colors[j], label=species_labels[j])
+
+    ax_norm.set_title("Embedding L2-Norm Evolution")
+    ax_norm.set_xlabel("Epoch")
+    ax_norm.set_ylabel("||Embedding||_2")
+    ax_norm.legend()
+
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    out_file = f"{out_dir}/atom_embeddings_grid.png"
+    fig.savefig(out_file, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    print(f"[INFO] Saved atom embeddings grid visualization to {out_file}")
+
+
+def load_losses_from_dir(dir_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Load train and val losses from a directory by checking trainer.pkl first,
+    falling back to parsing force_matching.log if necessary.
+
+    Parameters
+    ----------
+    dir_path : str
+        Path to the output directory.
+
+    Returns
+    -------
+    tuple[np.ndarray | None, np.ndarray | None]
+        (train_losses, val_losses) as numpy arrays or None if not found.
+    """
+    import os
+    import pickle
+    import re
+
+    train_losses = None
+    val_losses = None
+
+    pkl_path = os.path.join(dir_path, "trainer.pkl")
+    log_path = os.path.join(dir_path, "force_matching.log")
+
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            tr_matches = re.findall(r"Average train loss:\s*([0-9\.eE+-]+)", content)
+            vl_matches = re.findall(r"Average val loss:\s*([0-9\.eE+-]+)", content)
+            if tr_matches:
+                train_losses = [float(x) for x in tr_matches]
+            if vl_matches:
+                val_losses = [float(x) for x in vl_matches]
+        except Exception:
+            pass
+
+    if train_losses is None and os.path.exists(pkl_path):
+        try:
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+                if isinstance(data, dict):
+                    train_losses = data.get("train_losses")
+                    val_losses = data.get("val_losses")
+                elif hasattr(data, "train_losses"):
+                    train_losses = data.train_losses
+                    val_losses = getattr(data, "val_losses", None)
+        except Exception:
+            pass
+
+    if train_losses is not None:
+        train_losses = np.asarray(train_losses, dtype=float)
+    if val_losses is not None:
+        val_losses = np.asarray(val_losses, dtype=float)
+
+    return train_losses, val_losses
+
+
+def plot_multi_loss_comparison(
+    dir_paths: list[str],
+    labels: list[str] | None = None,
+    out_path: str = "loss_comparison.png",
+    mode: str = "both",
+    split_subplots: bool = False,
+    log_scale: bool = True,
+    title: str = "Loss Comparison",
+) -> str:
+    """
+    Plot losses from multiple output directories into a single plot.
+
+    Parameters
+    ----------
+    dir_paths : list[str]
+        List of directory paths to plot.
+    labels : list[str] | None, optional
+        Custom labels for each directory. If None, derived from folder names.
+    out_path : str, optional
+        Output file path to save figure.
+    mode : str, optional
+        'both', 'train', or 'val'
+    split_subplots : bool, optional
+        If True and mode is 'both', plot train and val in two side-by-side subplots.
+    log_scale : bool, optional
+        If True, use semilogy (log scale for y-axis).
+    title : str, optional
+        Title for the figure.
+
+    Returns
+    -------
+    str
+        Path to the saved figure.
+    """
+    import os
+
+    if not dir_paths:
+        raise ValueError("No directory paths provided for loss comparison plot.")
+
+    # Prepare labels
+    if labels is None:
+        labels = [os.path.basename(os.path.normpath(d)) for d in dir_paths]
+    elif len(labels) != len(dir_paths):
+        raise ValueError(f"Mismatch: {len(dir_paths)} directories provided, but {len(labels)} labels.")
+
+    # Color palette cycle
+    color_cycle = plt.cm.tab10.colors
+    if len(dir_paths) > 10:
+        color_cycle = plt.cm.tab20.colors
+
+    # Load data for each directory
+    data_list = []
+    for d, lbl in zip(dir_paths, labels):
+        tr, vl = load_losses_from_dir(d)
+        if tr is None and vl is None:
+            print(f"[WARNING] No loss data found in {d}")
+        else:
+            data_list.append((d, lbl, tr, vl))
+
+    if not data_list:
+        raise RuntimeError("No valid loss data could be loaded from any specified directory.")
+
+    if mode == "both" and split_subplots:
+        fig, (ax_tr, ax_vl) = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
+        fig.suptitle(title, fontsize=14, fontweight="bold")
+
+        plot_ax_tr = ax_tr.semilogy if log_scale else ax_tr.plot
+        plot_ax_vl = ax_vl.semilogy if log_scale else ax_vl.plot
+
+        for i, (d, lbl, tr, vl) in enumerate(data_list):
+            color = color_cycle[i % len(color_cycle)]
+            if tr is not None:
+                epochs = np.arange(len(tr))
+                plot_ax_tr(epochs, tr, label=lbl, color=color, linewidth=2.0)
+            if vl is not None:
+                epochs = np.arange(len(vl))
+                plot_ax_vl(epochs, vl, label=lbl, color=color, linewidth=2.0)
+
+        ax_tr.set_title("Training Loss")
+        ax_tr.set_xlabel("Epoch")
+        ax_tr.set_ylabel("Loss")
+        ax_tr.grid(True, linestyle="--", alpha=0.5)
+        ax_tr.legend(fontsize=9)
+
+        ax_vl.set_title("Validation Loss")
+        ax_vl.set_xlabel("Epoch")
+        ax_vl.set_ylabel("Loss")
+        ax_vl.grid(True, linestyle="--", alpha=0.5)
+        ax_vl.legend(fontsize=9)
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5.5), layout="constrained")
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        plot_ax = ax.semilogy if log_scale else ax.plot
+
+        for i, (d, lbl, tr, vl) in enumerate(data_list):
+            color = color_cycle[i % len(color_cycle)]
+            if mode in ("both", "train") and tr is not None:
+                epochs = np.arange(len(tr))
+                tr_label = f"{lbl} (Train)" if mode == "both" else lbl
+                plot_ax(epochs, tr, label=tr_label, color=color, linestyle="-", linewidth=2.0)
+
+            if mode in ("both", "val") and vl is not None:
+                epochs = np.arange(len(vl))
+                vl_label = f"{lbl} (Val)" if mode == "both" else lbl
+                linestyle = "--" if mode == "both" else "-"
+                plot_ax(epochs, vl, label=vl_label, color=color, linestyle=linestyle, linewidth=2.0, alpha=0.85)
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.legend(fontsize=9, loc="upper right")
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    print(f"[INFO] Saved loss comparison plot to {out_path}")
+    return out_path
+
+

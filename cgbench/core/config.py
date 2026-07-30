@@ -43,6 +43,10 @@ DEFAULT_MACE_CONFIG = {
     "train_ratio": 0.9,  
     "val_ratio": 0.1,  # Ratio of validation data, (Train_ratio + Val_ratio <= 1.0, rest is test data)
     "PRNGKey_seed": SEED,
+    "learned_species_embedding": False,
+    "species_embedding_dim": 16,
+    "use_direct_force_mapping": True,
+    "freeze_cg_after_epoch": None,
 }
 
 DEFAULT_NEQUIP_CONFIG = {
@@ -65,6 +69,7 @@ DEFAULT_TRAIN_CONFIG = {
     "gumbel_temp_3phase_points": [1.0, 0.4, 0.25, 0.1],
     "gumbel_temp_3phase_timings": [0.10, 0.90],
     "empty_bead_penalty_weight": 1000000.0,
+    "freeze_cg_after_epoch": None,
 }
 
 DEFAULT_SIM_CONFIG = {

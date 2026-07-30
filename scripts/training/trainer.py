@@ -7,7 +7,7 @@ from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, use_direct_force_mapping=False, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
@@ -16,6 +16,7 @@ class CGForceMatching(ForceMatching):
         self.empty_bead_penalty_weight = empty_bead_penalty_weight
         self.temperature = 1.0
         self.use_direct_force_mapping = use_direct_force_mapping
+        self.learned_species_embedding = learned_species_embedding
         self.epoch_cg_gradients = []
         self.saved_cg_gradients = {}
         
@@ -54,14 +55,27 @@ class CGForceMatching(ForceMatching):
             temperature = batch.get('temperature', jnp.array(1.0, dtype=jnp.float32))
 
             # Compute CG assignment
-            c_map, assignments = self.model_cg_map.apply(
-                {'params': params['cg_map']}, 
-                batch['R'], batch['species'], prng_key,
-                self.atom_masses,
-                deterministic=deterministic,
-                temperature=temperature,
-                return_assignments=True
-            )
+            if self.learned_species_embedding:
+                c_map, assignments, species_features = self.model_cg_map.apply(
+                    {'params': params['cg_map']}, 
+                    batch['R'], batch['species'], prng_key,
+                    self.atom_masses,
+                    deterministic=deterministic,
+                    temperature=temperature,
+                    return_assignments=True,
+                    return_species_features=True
+                )
+                cg_species = species_features
+            else:
+                c_map, assignments = self.model_cg_map.apply(
+                    {'params': params['cg_map']}, 
+                    batch['R'], batch['species'], prng_key,
+                    self.atom_masses,
+                    deterministic=deterministic,
+                    temperature=temperature,
+                    return_assignments=True
+                )
+                cg_species = jnp.tile(self.cg_species, (batch['R'].shape[0], 1))
 
             # Convert R to Cartesian space
             box_tensor = batch["box"][0]
@@ -95,8 +109,7 @@ class CGForceMatching(ForceMatching):
             R_cg = jax.vmap(lambda r: jnp.dot(inv_box_tensor, r.T).T)(R_cg_cart)
 
             # Pass actual CG species and masks for the target CG layer
-            cg_species = jnp.tile(self.cg_species, (R_cg.shape[0], 1))
-            cg_mask = jnp.sum(c_map, axis=-1) > 0.0
+            cg_mask = jnp.sum(assignments, axis=-2) > 0.0
 
             # Exclude temperature from cg_batch to prevent vmap ranking errors in base_model
             clean_batch = {k: v for k, v in batch.items() if k != 'temperature'}
@@ -192,6 +205,6 @@ class CGForceMatching(ForceMatching):
         self._update_fn = wrapped_update_fn
 
     def _update(self, batch):
-        # Inject current temperature into batch dictionary as a JAX array to prevent re-compilation
-        batch['temperature'] = jnp.array(self.temperature, dtype=jnp.float32)
+        # Inject current temperature into batch dictionary as a 1D JAX array matching batch_size to prevent multi-GPU sharding error
+        batch['temperature'] = jnp.full((batch['R'].shape[0],), self.temperature, dtype=jnp.float32)
         super()._update(batch)

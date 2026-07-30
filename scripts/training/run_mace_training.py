@@ -27,6 +27,12 @@ parser.add_argument(
     help="Freeze learned CG mapping weights after initialization",
 )
 parser.add_argument(
+    "--freeze-cg-after-epoch",
+    type=int,
+    help="Freeze learned CG mapping weights after a specific epoch number (0-indexed)",
+    default=None,
+)
+parser.add_argument(
     "--gumbel-temp",
     type=str,
     help="Gumbel temperature configuration: a number for constant temp or a string for schedule ('exponential' or 'linear')",
@@ -57,9 +63,11 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument(
-    "--use-direct-force-mapping",
-    action="store_true",
-    help="Use direct force mapping with assignments instead of coordinate map weights",
+    "--no-direct-force-mapping",
+    action="store_false",
+    dest="use_direct_force_mapping",
+    default=True,
+    help="Disable direct force mapping and use coordinate map weights instead",
 )
 parser.add_argument(
     "--gumbel-temp-3phase-points",
@@ -85,6 +93,17 @@ parser.add_argument(
     "--unique-cg-species",
     action="store_true",
     help="Use a unique species for each coarse-grained bead instead of sharing species from the heuristic map.",
+)
+parser.add_argument(
+    "--learned-species-embedding",
+    action="store_true",
+    help="Learn a feature vector for each atom type and combine (add) them to get species features for MACE.",
+)
+parser.add_argument(
+    "--species-embedding-dim",
+    type=int,
+    help="Dimension of learned species embedding features for MACE",
+    default=None,
 )
 args = parser.parse_args()
 
@@ -118,7 +137,20 @@ MACE_CONFIG["CG_map"] = cg_map_choice
 MACE_CONFIG["use_bond_priors"] = args.prior
 MACE_CONFIG["type"] = "CG" if MACE_CONFIG["CG_map"] != "AT" else "AT"
 MACE_CONFIG["freeze_cg"] = args.freeze_cg or MACE_CONFIG.get("freeze_cg", False)
+if args.freeze_cg_after_epoch is not None:
+    MACE_CONFIG["freeze_cg_after_epoch"] = args.freeze_cg_after_epoch
+    TRAIN_CONFIG["freeze_cg_after_epoch"] = args.freeze_cg_after_epoch
+
+MACE_CONFIG["use_direct_force_mapping"] = args.use_direct_force_mapping
 MACE_CONFIG["unique_cg_species"] = args.unique_cg_species or MACE_CONFIG.get("unique_cg_species", False)
+MACE_CONFIG["learned_species_embedding"] = args.learned_species_embedding or MACE_CONFIG.get("learned_species_embedding", False)
+if MACE_CONFIG["unique_cg_species"] and MACE_CONFIG["learned_species_embedding"]:
+    raise ValueError(
+        "[ERROR] --unique-cg-species and --learned-species-embedding are mutually exclusive and cannot both be activated."
+    )
+
+if args.species_embedding_dim is not None:
+    MACE_CONFIG["species_embedding_dim"] = args.species_embedding_dim
 
 gumbel_temp_choice = args.gumbel_temp
 if gumbel_temp_choice is None:
@@ -139,8 +171,10 @@ if args.gumbel_temp_3phase_timings is not None:
 
 if args.epochs is not None:
     TRAIN_CONFIG["num_epochs"] = args.epochs
-if MACE_CONFIG["freeze_cg"] and MACE_CONFIG["CG_map"] != "learned":
-    print("[WARNING] --freeze-cg was specified, but CG mapping choice is not 'learned'. Freezing has no effect.")
+
+freeze_after = MACE_CONFIG.get("freeze_cg_after_epoch", None)
+if (MACE_CONFIG["freeze_cg"] or freeze_after is not None) and MACE_CONFIG["CG_map"] != "learned":
+    print("[WARNING] --freeze-cg or --freeze-cg-after-epoch was specified, but CG mapping choice is not 'learned'. Freezing has no effect.")
 
 
 # -------------------------
@@ -191,19 +225,33 @@ else:
     n_species = data.n_species
 
 if MACE_CONFIG["CG_map"] == "learned":
-    freeze_suffix = f"_freezecg={MACE_CONFIG['freeze_cg']}"
+    freeze_after = MACE_CONFIG.get("freeze_cg_after_epoch", None)
+    if MACE_CONFIG["freeze_cg"]:
+        freeze_suffix = f"_freezecg={MACE_CONFIG['freeze_cg']}"
+    elif freeze_after is not None:
+        freeze_suffix = f"_freezecg_after={freeze_after}"
+    else:
+        freeze_suffix = ""
     gumbel_temp_suffix = f"_gumbeltemp={TRAIN_CONFIG['gumbel_temp']}"
-    direct_force_map_suffix = f"_directforcemap={args.use_direct_force_mapping}"
-    unique_species_suffix = f"_uniquespecies={MACE_CONFIG['unique_cg_species']}"
+    if not MACE_CONFIG["use_direct_force_mapping"]:
+        direct_force_map_suffix = "_directforcemap=False"
+    else:
+        direct_force_map_suffix = ""
+    if MACE_CONFIG["unique_cg_species"]:
+        species_suffix = "_uniquespecies=True"
+    elif MACE_CONFIG["learned_species_embedding"]:
+        species_suffix = "_learnedspecies=True"
+    else:
+        species_suffix = ""
     print("[INFO] Gumbel temperature: ", TRAIN_CONFIG["gumbel_temp"])
 else:
     freeze_suffix = ""
     gumbel_temp_suffix = ""
     direct_force_map_suffix = ""
-    unique_species_suffix = ""
+    species_suffix = ""
 
 label_suffix = f"_{args.label}" if args.label is not None else ""
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{unique_species_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
 os.makedirs(output_dir, exist_ok=True)
 
 if MACE_CONFIG["CG_map"] == "learned":
@@ -284,9 +332,13 @@ if MACE_CONFIG["type"] == "CG":
                 print(f"[WARNING] Error reading heuristic map for initialization: {e}")
 
 if MACE_CONFIG["CG_map"] == "learned":
-    n_cg_species = len(set(cg_species.tolist()))
-    n_species = n_cg_species
-    print(f"[INFO] MACE model initialized with {n_species} CG species: {set(cg_species.tolist())}")
+    if MACE_CONFIG["learned_species_embedding"]:
+        n_species = MACE_CONFIG.get("species_embedding_dim", 16)
+        print(f"[INFO] MACE model initialized with learned species embedding dim={n_species}")
+    else:
+        n_cg_species = len(set(cg_species.tolist()))
+        n_species = n_cg_species
+        print(f"[INFO] MACE model initialized with {n_species} CG species: {set(cg_species.tolist())}")
 
     # Create mass-weighted mapping matrix for neighbor list allocation
     # Must match the static path's get_map_weights (m_i / M_I) to ensure
@@ -420,11 +472,13 @@ def energy_fn_template(energy_params):
         if pots.ndim == 2 and pots.shape[-1] == 1:
             pots = pots.squeeze(-1)
 
-        atomic_numbers = jnp.asarray(model_config["atomic_numbers"], dtype=jnp.int32)
-        atomic_energies = jnp.asarray(model_config["atomic_energies"], dtype=jnp.float32)
-        mapped_species = jnp.argmax(dynamic_kwargs["species"][:, None] == atomic_numbers[None, :], axis=-1)
-
-        pots = (pots - atomic_energies[mapped_species]) * mask
+        if jnp.issubdtype(dynamic_kwargs["species"].dtype, jnp.floating):
+            pots = pots * mask
+        else:
+            atomic_numbers = jnp.asarray(model_config["atomic_numbers"], dtype=jnp.int32)
+            atomic_energies = jnp.asarray(model_config["atomic_energies"], dtype=jnp.float32)
+            mapped_species = jnp.argmax(dynamic_kwargs["species"][:, None] == atomic_numbers[None, :], axis=-1)
+            pots = (pots - atomic_energies[mapped_species]) * mask
         return jnp.sum(pots)
     
     if args.prior:
@@ -456,12 +510,21 @@ if MACE_CONFIG["CG_map"] == "learned":
     mask_init_cg = jnp.ones(num_cg_beads, dtype=jnp.bool_)
     nbrs_init = nbrs_init.update(r_init_cg, mask=mask_init_cg)
 
-    cg_model = GumbelCGAssignment(num_cg_beads=num_cg_beads, initial_mapping=initial_mapping)
+    unique_atom_species_tuple = tuple(sorted(list(set(dataset["training"]["species"][0].tolist()))))
+    cg_model = GumbelCGAssignment(
+        num_cg_beads=num_cg_beads,
+        initial_mapping=initial_mapping,
+        learned_species_embedding=MACE_CONFIG["learned_species_embedding"],
+        species_embedding_dim=MACE_CONFIG["species_embedding_dim"],
+        unique_atom_species=unique_atom_species_tuple,
+    )
+    prng_seed = MACE_CONFIG.get("PRNGKey_seed", 42)
+    key_init, key_gumbel = jax.random.split(jax.random.PRNGKey(prng_seed))
     cg_params = cg_model.init(
-        jax.random.PRNGKey(0),
+        key_init,
         r_init,
         dataset["training"]["species"][0],
-        jax.random.PRNGKey(1),
+        key_gumbel,
         atom_masses=masses,
         deterministic=False
     )
@@ -501,13 +564,23 @@ if args.verbose:
 # -------------------------
 from chemtrain.trainers import ForceMatching
 
+def make_cg_labels(params, learned_species_embedding=False):
+    def label_fn(path, leaf):
+        path_strs = [str(p.key) if hasattr(p, 'key') else str(p) for p in path]
+        if path_strs[0] == 'cg_map':
+            if 'atom_type_embeddings' in path_strs and learned_species_embedding:
+                return 'trainable'
+            return 'frozen'
+        return 'trainable'
+    return jax.tree_util.tree_map_with_path(label_fn, params)
+
 if MACE_CONFIG["CG_map"] == "learned":
     cg_save_freq = TRAIN_CONFIG.get("cg_save_freq", 5)
     joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
     
     if MACE_CONFIG["freeze_cg"]:
         print("[INFO] Freezing learned CG assignment weights.")
-        labels = {'mace': 'trainable', 'cg_map': 'frozen'}
+        labels = make_cg_labels(joint_params, learned_species_embedding=MACE_CONFIG["learned_species_embedding"])
         optimizer_fm = optax.multi_transform(
             {'trainable': optimizer_fm, 'frozen': optax.set_to_zero()},
             labels
@@ -525,14 +598,59 @@ if MACE_CONFIG["CG_map"] == "learned":
         atom_masses=masses,
         freeze_cg=MACE_CONFIG["freeze_cg"],
         empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0),
-        use_direct_force_mapping=args.use_direct_force_mapping
+        use_direct_force_mapping=MACE_CONFIG["use_direct_force_mapping"],
+        learned_species_embedding=MACE_CONFIG["learned_species_embedding"]
     )
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}
+    trainer_fm.saved_cg_gradients = {}
+
+    def check_freeze_cg_after_epoch(trainer, *args, **kwargs):
+        epoch = trainer._epoch
+        freeze_after = MACE_CONFIG.get("freeze_cg_after_epoch", None)
+        if freeze_after is not None and epoch >= freeze_after:
+            if not trainer.freeze_cg:
+                print(f"[INFO] Epoch {epoch} >= freeze_cg_after_epoch ({freeze_after}): Freezing learned CG assignment weights.")
+                trainer.freeze_cg = True
 
     def print_learned_mapping(trainer, *args, **kwargs):
         cg_map_params = trainer.params.get('cg_map', None)
         if cg_map_params is not None:
+            epoch = trainer._epoch
+
+            # Aggregate and save CG gradients every x epochs and at the final epoch
+            if hasattr(trainer, "epoch_cg_gradients") and trainer.epoch_cg_gradients:
+                if not hasattr(trainer, "saved_cg_gradients"):
+                    trainer.saved_cg_gradients = {}
+                cg_save_freq = getattr(trainer, "cg_save_freq", 5)
+                if epoch % cg_save_freq == 0 or epoch == epochs - 1:
+                    avg_kernel_grad = onp.mean([g['kernel'] for g in trainer.epoch_cg_gradients], axis=0)
+                    avg_bias_grad = onp.mean([g['bias'] for g in trainer.epoch_cg_gradients], axis=0)
+                    trainer.saved_cg_gradients[int(epoch)] = {
+                        'kernel': avg_kernel_grad.tolist(),
+                        'bias': avg_bias_grad.tolist()
+                    }
+                trainer.epoch_cg_gradients.clear()
+
+            # Save atom embeddings if learned_species_embedding is enabled
+            if MACE_CONFIG["learned_species_embedding"]:
+                atom_type_embeddings = cg_map_params.get('atom_type_embeddings', None)
+                if atom_type_embeddings is not None:
+                    if not hasattr(trainer, "saved_atom_embeddings"):
+                        trainer.saved_atom_embeddings = {}
+                    cg_save_freq = getattr(trainer, "cg_save_freq", 5)
+                    if epoch % cg_save_freq == 0 or epoch == epochs - 1:
+                        unique_species = getattr(cg_model, "unique_atom_species", None)
+                        emb_arr = jax.device_get(atom_type_embeddings)
+                        emb_dict = {}
+                        if unique_species is not None:
+                            for idx, spec in enumerate(unique_species):
+                                emb_dict[int(spec)] = emb_arr[idx].tolist()
+                        else:
+                            for idx in range(emb_arr.shape[0]):
+                                emb_dict[int(idx)] = emb_arr[idx].tolist()
+                        trainer.saved_atom_embeddings[int(epoch)] = emb_dict
+
             dense_keys = [k for k in cg_map_params.keys() if 'Dense' in k]
             if dense_keys:
                 dense_params = cg_map_params[dense_keys[0]]
@@ -545,7 +663,6 @@ if MACE_CONFIG["CG_map"] == "learned":
                         logits = kernel
                     
                     assignments = jnp.argmax(logits, axis=-1)
-                    epoch = trainer._epoch
                     print(f"\n--- Learned CG Mapping at Epoch {epoch} ---")
                     
                     # Print kernel stats
@@ -569,22 +686,7 @@ if MACE_CONFIG["CG_map"] == "learned":
                     print("CG Beads to Atoms:")
                     for bead_idx in sorted(bead_to_atoms.keys()):
                         print(f"  Bead {bead_idx}: Atoms {bead_to_atoms[bead_idx]}")
-                    
-                    # Calculate and save mean gradients for this epoch
-                    if hasattr(trainer, "epoch_cg_gradients") and trainer.epoch_cg_gradients:
-                        mean_kernel_grad = onp.mean([g['kernel'] for g in trainer.epoch_cg_gradients], axis=0)
-                        mean_bias_grad = onp.mean([g['bias'] for g in trainer.epoch_cg_gradients], axis=0)
-                        
-                        if not hasattr(trainer, "saved_cg_gradients"):
-                            trainer.saved_cg_gradients = {}
-                        
-                        if epoch % cg_save_freq == 0 or epoch == epochs - 1:
-                            trainer.saved_cg_gradients[int(epoch)] = {
-                                'kernel': mean_kernel_grad.tolist(),
-                                'bias': mean_bias_grad.tolist()
-                            }
-                        trainer.epoch_cg_gradients = []
-                        
+
                     print("-------------------------------------------\n", flush=True)
 
     def update_gumbel_temperature(trainer, *args, **kwargs):
@@ -625,6 +727,7 @@ if MACE_CONFIG["CG_map"] == "learned":
                 raise ValueError(f"Unknown Gumbel temperature schedule: {gumbel_temp_choice}")
             print(f"[INFO] Gumbel-Softmax temperature set to {trainer.temperature:.4f} for Epoch {epoch}")
 
+    trainer_fm.add_task("pre_epoch", check_freeze_cg_after_epoch)
     trainer_fm.add_task("pre_epoch", update_gumbel_temperature)
     trainer_fm.add_task("post_epoch", print_learned_mapping)
 else:
@@ -640,7 +743,7 @@ else:
 
 trainer_fm.set_dataset(dataset["training"], stage="training", rng_seed=MACE_CONFIG.get("PRNGKey_seed", 42))
 trainer_fm.set_dataset(dataset["validation"], stage="validation", include_all=True)
-if "testing" in dataset:
+if "testing" in dataset and dataset["testing"]["R"].shape[0] >= batch_size:
     trainer_fm.set_dataset(dataset["testing"], stage="testing", include_all=True)
 
 # -------------------------
@@ -666,19 +769,30 @@ if MACE_CONFIG["CG_map"] == "learned":
         json.dump(trainer_fm.saved_cg_maps, f, indent=4)
     print(f"[INFO] Saved CG maps to {cg_maps_path}")
 
-    # Save cg gradients to json
-    cg_grads_path = f"{output_dir}/cg_gradients.json"
-    with open(cg_grads_path, "w") as f:
-        json.dump(trainer_fm.saved_cg_gradients, f, indent=4)
-    print(f"[INFO] Saved CG gradients to {cg_grads_path}")
+    if MACE_CONFIG["learned_species_embedding"] and hasattr(trainer_fm, "saved_atom_embeddings") and trainer_fm.saved_atom_embeddings:
+        atom_emb_path = f"{output_dir}/atom_embeddings.json"
+        with open(atom_emb_path, "w") as f:
+            json.dump(trainer_fm.saved_atom_embeddings, f, indent=4)
+        print(f"[INFO] Saved atom embeddings to {atom_emb_path}")
 
-    # Generate gradient visualization and grid plot automatically
-    try:
-        import subprocess
-        viz_script = os.path.join(os.path.dirname(__file__), "visualize_cg_gradients.py")
-        subprocess.run([sys.executable, viz_script, cg_grads_path], check=True)
-    except Exception as e:
-        print(f"[WARNING] Could not automatically generate gradient visualization: {e}")
+        try:
+            from cgbench.plotting.training import plot_atom_embeddings_grid
+            plot_atom_embeddings_grid(trainer_fm.saved_atom_embeddings, output_dir)
+        except Exception as e:
+            print(f"[WARNING] Could not generate atom embeddings grid visualization: {e}")
+
+    if hasattr(trainer_fm, "saved_cg_gradients") and trainer_fm.saved_cg_gradients:
+        cg_grads_path = f"{output_dir}/cg_gradients.json"
+        with open(cg_grads_path, "w") as f:
+            json.dump(trainer_fm.saved_cg_gradients, f, indent=4)
+        print(f"[INFO] Saved CG gradients to {cg_grads_path}")
+
+        try:
+            import subprocess
+            viz_script = os.path.join(os.path.dirname(__file__), "visualize_cg_gradients.py")
+            subprocess.run([sys.executable, viz_script, cg_grads_path], check=True)
+        except Exception as e:
+            print(f"[WARNING] Could not automatically generate gradient visualization: {e}")
 
     # Create visualization of CG maps over time
     try:
@@ -743,7 +857,7 @@ else:
         predictions_val, dataset["validation"], output_dir, name="preds_validation"
     )
 
-if "testing" in dataset:
+if "testing" in dataset and dataset["testing"]["R"].shape[0] >= batch_size:
     predictions_test = trainer_fm.predict(
         dataset["testing"],
         trainer_fm.best_params,
