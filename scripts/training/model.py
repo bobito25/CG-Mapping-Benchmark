@@ -18,6 +18,7 @@ class GumbelCGAssignment(fnn.Module):
     num_cg_beads: int
     initial_mapping: tuple = None
     learned_species_embedding: bool = False
+    normalize_atom_embedding: bool = False
     species_embedding_dim: int = 16
     unique_atom_species: tuple = None
 
@@ -71,7 +72,7 @@ class GumbelCGAssignment(fnn.Module):
 
         # Weight assignments by mass
         weighted_assignments = assignments * node_masses[..., None]
-        bead_masses = jnp.sum(weighted_assignments, axis=-2, keepdims=True) + 1e-8
+        bead_masses = jnp.maximum(jnp.sum(weighted_assignments, axis=-2, keepdims=True), 1e-3)
         
         # Transpose the last two dimensions to get [..., num_cg_beads, num_nodes]
         c_map = jnp.swapaxes(weighted_assignments, -1, -2) / jnp.swapaxes(bead_masses, -1, -2)
@@ -96,6 +97,10 @@ class GumbelCGAssignment(fnn.Module):
                 fnn.initializers.normal(stddev=0.1),
                 (num_atom_types, self.species_embedding_dim)
             )
+            if self.normalize_atom_embedding:
+                norm = jnp.linalg.norm(atom_type_embeddings, axis=-1, keepdims=True)
+                atom_type_embeddings = atom_type_embeddings / (norm + 1e-8)
+
             species_features = jnp.matmul(bead_atom_types, atom_type_embeddings) # [..., num_cg_beads, species_embedding_dim]
 
         if return_assignments and return_species_features:

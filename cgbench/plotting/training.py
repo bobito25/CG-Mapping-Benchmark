@@ -389,11 +389,12 @@ def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None
 
     cols = min(4, num_epochs)
     rows = int(np.ceil(num_epochs / cols))
+    grid_cols = max(3, cols)
 
-    fig = plt.figure(figsize=(4 * cols + 2, 3.5 * (rows + 1)), layout="constrained")
+    fig = plt.figure(figsize=(4 * grid_cols, 3.5 * (rows + 1)), layout="constrained")
     fig.suptitle("Learned Atom-Type Embeddings Over Training Epochs", fontsize=16, fontweight="bold")
 
-    gs = fig.add_gridspec(rows + 1, cols)
+    gs = fig.add_gridspec(rows + 1, grid_cols)
 
     vmin, vmax = data_matrix.min(), data_matrix.max()
     im = None
@@ -420,9 +421,11 @@ def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None
         cbar.set_label("Embedding Value")
 
     flat_matrix = data_matrix.reshape(-1, emb_dim)
-    ax_pca_cols = max(1, cols // 2)
-    ax_pca = fig.add_subplot(gs[rows, :ax_pca_cols])
-    ax_norm = fig.add_subplot(gs[rows, ax_pca_cols:])
+    ax_pca = fig.add_subplot(gs[rows, 0])
+    ax_norm = fig.add_subplot(gs[rows, 1])
+    ax_cossim = fig.add_subplot(gs[rows, 2])
+
+    colors = plt.cm.Set1(np.linspace(0, 1, max(1, num_atom_types)))
 
     if emb_dim >= 2:
         try:
@@ -432,7 +435,6 @@ def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None
             proj = centered @ vh[:2].T
             proj = proj.reshape(num_epochs, num_atom_types, 2)
 
-            colors = plt.cm.Set1(np.linspace(0, 1, max(1, num_atom_types)))
             for j in range(num_atom_types):
                 traj = proj[:, j, :]
                 ax_pca.plot(traj[:, 0], traj[:, 1], "o-", color=colors[j], label=species_labels[j], alpha=0.8)
@@ -449,7 +451,6 @@ def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None
         ax_pca.text(0.5, 0.5, "Embedding dim < 2", ha="center", va="center")
 
     norms = np.linalg.norm(data_matrix, axis=-1)
-    colors = plt.cm.Set1(np.linspace(0, 1, max(1, num_atom_types)))
     for j in range(num_atom_types):
         ax_norm.plot(epochs, norms[:, j], "o-", color=colors[j], label=species_labels[j])
 
@@ -458,12 +459,62 @@ def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None
     ax_norm.set_ylabel("||Embedding||_2")
     ax_norm.legend()
 
+    # Compute Cosine Similarity relative to Epoch 0
+    norm_expanded = np.maximum(norms[:, :, None], 1e-8)
+    unit_matrix = data_matrix / norm_expanded  # shape: (num_epochs, num_atom_types, emb_dim)
+    cos_sim_ep0 = np.sum(unit_matrix * unit_matrix[0:1, :, :], axis=-1)  # shape: (num_epochs, num_atom_types)
+
+    for j in range(num_atom_types):
+        ax_cossim.plot(epochs, cos_sim_ep0[:, j], "o-", color=colors[j], label=species_labels[j])
+
+    ax_cossim.set_title("Cosine Sim to Epoch 0 (Direction Shift)")
+    ax_cossim.set_xlabel("Epoch")
+    ax_cossim.set_ylabel("CosSim(v_t, v_0)")
+    ax_cossim.set_ylim(-1.05, 1.05)
+    ax_cossim.grid(True, linestyle="--", alpha=0.5)
+    ax_cossim.legend()
+
     import os
     os.makedirs(out_dir, exist_ok=True)
     out_file = f"{out_dir}/atom_embeddings_grid.png"
     fig.savefig(out_file, bbox_inches="tight", dpi=300)
     plt.close(fig)
     print(f"[INFO] Saved atom embeddings grid visualization to {out_file}")
+
+    # Generate normalized unit-vector heatmaps grid (Directional heatmaps)
+    try:
+        fig_norm = plt.figure(figsize=(4 * cols + 2, 3.5 * rows), layout="constrained")
+        fig_norm.suptitle("Normalized Atom Embeddings (Directional Unit Vectors)", fontsize=16, fontweight="bold")
+        gs_norm = fig_norm.add_gridspec(rows, cols)
+        im_norm = None
+
+        for i, ep in enumerate(epochs):
+            r, c = i // cols, i % cols
+            ax_n = fig_norm.add_subplot(gs_norm[r, c])
+            im_norm = ax_n.imshow(
+                unit_matrix[i],
+                aspect="auto",
+                cmap="coolwarm",
+                vmin=-1.0,
+                vmax=1.0,
+            )
+            ax_n.set_title(f"Epoch {ep}", fontsize=11)
+            ax_n.set_yticks(np.arange(num_atom_types))
+            ax_n.set_yticklabels(species_labels)
+            ax_n.set_xlabel("Embedding Dim")
+            if c == 0:
+                ax_n.set_ylabel("Atom Type")
+
+        if im_norm is not None:
+            cbar_n = fig_norm.colorbar(im_norm, ax=fig_norm.axes[:num_epochs], shrink=0.8, location="right")
+            cbar_n.set_label("Normalized Feature Value")
+
+        out_norm_file = f"{out_dir}/atom_embeddings_normalized_grid.png"
+        fig_norm.savefig(out_norm_file, bbox_inches="tight", dpi=300)
+        plt.close(fig_norm)
+        print(f"[INFO] Saved normalized atom embeddings grid visualization to {out_norm_file}")
+    except Exception as e:
+        print(f"[WARNING] Could not save normalized atom embeddings grid: {e}")
 
 
 def load_losses_from_dir(dir_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -642,5 +693,87 @@ def plot_multi_loss_comparison(
     plt.close(fig)
     print(f"[INFO] Saved loss comparison plot to {out_path}")
     return out_path
+
+
+def plot_per_bead_force_losses(per_bead_data: dict, out_dir: str) -> None:
+    """
+    Plot per-bead force MSE losses over training epochs and final per-bead loss bar chart with variance.
+
+    Parameters
+    ----------
+    per_bead_data : dict
+        Dictionary containing 'epochs', 'val_mean' (shape: [epochs, n_beads]), and 'val_var' (shape: [epochs, n_beads]).
+    out_dir : str
+        Output directory to save the figures.
+    """
+    import os
+    if not per_bead_data or "val_mean" not in per_bead_data:
+        return
+
+    epochs = np.array(per_bead_data["epochs"])
+    means = np.array(per_bead_data["val_mean"])  # shape: (n_epochs, n_beads)
+    vars = np.array(per_bead_data["val_var"])    # shape: (n_epochs, n_beads)
+    stds = np.sqrt(np.maximum(vars, 0.0))
+
+    if means.ndim != 2 or means.shape[0] == 0:
+        return
+
+    n_epochs, n_beads = means.shape
+    colors = plt.cm.tab20(np.linspace(0, 1, max(1, n_beads)))
+
+    # Figure 1: Trajectory of force loss per bead over epochs with shaded std dev band
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 5), layout="constrained")
+    for b in range(n_beads):
+        mean_b = means[:, b]
+        std_b = stds[:, b]
+        ax.plot(epochs, mean_b, label=f"Bead {b}", color=colors[b % len(colors)], linewidth=2.0)
+        ax.fill_between(
+            epochs,
+            np.maximum(mean_b - std_b, 0.0),
+            mean_b + std_b,
+            color=colors[b % len(colors)],
+            alpha=0.15,
+        )
+
+    ax.set_title("Per-Bead Force Loss Convergence (\u03bc \u00b1 \u03c3)", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Force MSE Loss")
+    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(fontsize=9, bbox_to_anchor=(1.04, 1), loc="upper left")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_traj_file = os.path.join(out_dir, "per_bead_force_losses.png")
+    fig.savefig(out_traj_file, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    print(f"[INFO] Saved per-bead force loss plot to {out_traj_file}")
+
+    # Figure 2: Final epoch per-bead force loss bar chart with error bars
+    fig_bar, ax_bar = plt.subplots(1, 1, figsize=(6.5, 4.5), layout="constrained")
+    final_means = means[-1]
+    final_stds = stds[-1]
+    bead_indices = np.arange(n_beads)
+
+    ax_bar.bar(
+        bead_indices,
+        final_means,
+        yerr=final_stds,
+        capsize=4,
+        color=colors[:n_beads],
+        edgecolor="black",
+        alpha=0.85,
+    )
+
+    ax_bar.set_title(f"Final Epoch ({epochs[-1]}) Per-Bead Force Loss", fontsize=13, fontweight="bold")
+    ax_bar.set_xlabel("Bead Index")
+    ax_bar.set_ylabel("Force MSE Loss")
+    ax_bar.set_xticks(bead_indices)
+    ax_bar.set_xticklabels([f"Bead {i}" for i in bead_indices], rotation=45 if n_beads > 10 else 0)
+    ax_bar.grid(True, linestyle="--", alpha=0.5, axis="y")
+
+    out_bar_file = os.path.join(out_dir, "per_bead_force_losses_final.png")
+    fig_bar.savefig(out_bar_file, bbox_inches="tight", dpi=300)
+    plt.close(fig_bar)
+    print(f"[INFO] Saved final per-bead force loss bar chart to {out_bar_file}")
+
 
 

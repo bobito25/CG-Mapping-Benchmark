@@ -24,3 +24,4 @@ setup.py
 checkpoints/
 tests/
 commands.txt
+past_commands.txt

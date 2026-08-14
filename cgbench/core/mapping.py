@@ -1,3 +1,4 @@
+from collections import Counter
 from jax import numpy as jnp, lax
 import jax
 import functools
@@ -112,6 +113,46 @@ def get_map_weights(
 
     weights = onehot * per_atom_w
     return weights
+
+
+def register_custom_map(map_obj, custom_indices):
+    """Registers a custom mapping on map_obj, assigning CG species based on atom composition.
+
+    Beads with the same atom composition (e.g., 2 H and 1 C) will be assigned the same species ID.
+    """
+    custom_indices = list(custom_indices)
+    valid_indices = [idx for idx in custom_indices if idx >= 0]
+    n_cg = max(valid_indices) + 1 if valid_indices else 0
+
+    map_species = getattr(map_obj, "map_species", getattr(map_obj, "species", None))
+
+    if map_species is not None:
+        composition_to_species = {}
+        next_species_id = 1
+        cg_species_list = []
+
+        for bead_idx in range(n_cg):
+            assigned_atoms = [i for i, idx in enumerate(custom_indices) if idx == bead_idx]
+            atom_elements = [str(map_species[i]) for i in assigned_atoms if i < len(map_species)]
+            counts = Counter(atom_elements)
+            # Composition key is a canonical tuple of sorted (element, count) pairs
+            comp_key = tuple(sorted(counts.items()))
+
+            if comp_key not in composition_to_species:
+                composition_to_species[comp_key] = next_species_id
+                next_species_id += 1
+
+            cg_species_list.append(composition_to_species[comp_key])
+
+        cg_species = np.array(cg_species_list, dtype=np.int32)
+    else:
+        cg_species = np.arange(1, n_cg + 1, dtype=np.int32)
+
+    if hasattr(map_obj, "_maps"):
+        map_obj._maps["custom"] = {
+            "indices": custom_indices,
+            "cg_species": cg_species,
+        }
 
 
 class Hexane_Map:

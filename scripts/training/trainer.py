@@ -204,7 +204,77 @@ class CGForceMatching(ForceMatching):
             return outputs
         self._update_fn = wrapped_update_fn
 
+    def evaluate_per_bead_forces(self, dataset, params=None, batch_size=32):
+        return evaluate_per_bead_forces(self, dataset, params=params, batch_size=batch_size)
+
     def _update(self, batch):
         # Inject current temperature into batch dictionary as a 1D JAX array matching batch_size to prevent multi-GPU sharding error
         batch['temperature'] = jnp.full((batch['R'].shape[0],), self.temperature, dtype=jnp.float32)
         super()._update(batch)
+
+
+def evaluate_per_bead_forces(trainer, dataset, params=None, batch_size=32):
+    """
+    Evaluate per-bead force MSE loss mean and variance across the provided dataset.
+
+    Parameters
+    ----------
+    trainer : ForceMatching or CGForceMatching
+        The trainer instance.
+    dataset : dict
+        Dataset containing 'R', 'F', etc.
+    params : dict, optional
+        Model parameters. If None, uses trainer.params.
+    batch_size : int, optional
+        Batch size for prediction.
+
+    Returns
+    -------
+    mean_per_bead : np.ndarray of shape (num_beads,)
+        Mean force MSE loss for each bead across all frames.
+    var_per_bead : np.ndarray of shape (num_beads,)
+        Variance of force MSE loss for each bead across all frames.
+    """
+    import numpy as onp
+    from jax import tree_util
+
+    if params is None:
+        params = getattr(trainer, "params", None)
+        if params is None and hasattr(trainer, "best_params"):
+            params = trainer.best_params
+
+    preds = trainer.predict(dataset, params, batch_size=batch_size)
+    preds = tree_util.tree_map(onp.asarray, preds)
+
+    pred_F = preds["F"]
+    if "Mapped_Target_F" in preds:
+        ref_F = preds["Mapped_Target_F"]
+    elif "F" in dataset:
+        ref_F = onp.asarray(dataset["F"])
+    else:
+        raise ValueError("Reference forces not found in predictions or dataset.")
+
+    n_samples = min(len(pred_F), len(ref_F))
+    pred_F = pred_F[:n_samples]
+    ref_F = ref_F[:n_samples]
+
+    # Force squared error per bead per sample: sum over spatial 3D dimensions
+    diff = pred_F - ref_F
+    sq_err = onp.sum(diff ** 2, axis=-1)  # shape: (n_samples, n_beads)
+
+    if "mask" in preds:
+        mask = onp.asarray(preds["mask"])[:n_samples]
+        n_beads = sq_err.shape[1]
+        mean_per_bead = onp.zeros(n_beads, dtype=onp.float32)
+        var_per_bead = onp.zeros(n_beads, dtype=onp.float32)
+        for b in range(n_beads):
+            valid_samples = sq_err[:, b][mask[:, b] > 0]
+            if len(valid_samples) > 0:
+                mean_per_bead[b] = onp.mean(valid_samples)
+                var_per_bead[b] = onp.var(valid_samples)
+    else:
+        mean_per_bead = onp.mean(sq_err, axis=0)
+        var_per_bead = onp.var(sq_err, axis=0)
+
+    return mean_per_bead, var_per_bead
+

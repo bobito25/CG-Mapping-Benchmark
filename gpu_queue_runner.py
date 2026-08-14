@@ -19,11 +19,11 @@ def setup_logging(log_file):
         ]
     )
 
-def get_free_gpus(ignored_pattern="gmx"):
-    # 1. Query all GPUs to map UUID to index
+def get_free_gpus(ignored_pattern="gmx", max_memory_mb=2048, max_gpu_util=20):
+    # 1. Query all GPUs to map UUID to index and check memory/utilization thresholds
     try:
         res_gpus = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,uuid,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -39,12 +39,27 @@ def get_free_gpus(ignored_pattern="gmx"):
         if not line.strip():
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 2:
-            idx, uuid = parts[0], parts[1]
+        if len(parts) >= 4:
+            idx, uuid, mem_used_str, util_str = parts[0], parts[1], parts[2], parts[3]
+            try:
+                mem_used = float(mem_used_str)
+                gpu_util = float(util_str)
+            except ValueError:
+                logging.warning(f"Could not parse memory ({mem_used_str}) or util ({util_str}) for GPU {idx}. Skipping.")
+                continue
+
+            # First priority check: memory usage < 2GB (2048MB) and gpu util < 20%
+            if mem_used >= max_memory_mb or gpu_util >= max_gpu_util:
+                logging.debug(f"GPU {idx} filtered out: memory={mem_used}MB (max {max_memory_mb}MB), util={gpu_util}% (max {max_gpu_util}%)")
+                continue
+
             gpu_list.append(idx)
             uuid_to_index[uuid] = idx
 
-    # 2. Query compute processes
+    if not gpu_list:
+        return []
+
+    # 2. Query compute processes for candidate GPUs
     gpu_processes = {idx: [] for idx in gpu_list}
     try:
         res_apps = subprocess.run(
@@ -77,7 +92,7 @@ def get_free_gpus(ignored_pattern="gmx"):
         logging.error(f"Unexpected error querying compute apps: {e}")
         return []
 
-    # 3. Filter free GPUs
+    # 3. Filter free GPUs based on active processes and ignored patterns
     free_gpus = []
     for idx in gpu_list:
         procs = gpu_processes[idx]
@@ -124,6 +139,19 @@ def get_and_pop_command(commands_file):
         logging.error(f"Failed to pop command from queue file: {e}")
     return None
 
+def append_past_command(command, past_commands_file):
+    if not command:
+        return
+    try:
+        with open(past_commands_file, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.write(command.strip() + "\n")
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        logging.error(f"Failed to append command to past commands file ({past_commands_file}): {e}")
+
 def wrap_command_nohup(command, logs_dir, chosen_gpu):
     cmd_clean = command.strip()
     
@@ -161,10 +189,12 @@ def wrap_command_nohup(command, logs_dir, chosen_gpu):
 
 def main():
     parser = argparse.ArgumentParser(description="GPU Command Queue Runner")
-    parser.add_argument("--root-dir", type=str, default="~/idp/CG-Mapping-Benchmark",
+    parser.add_argument("--root-dir", type=str, default="/ds/students/go38zin_leon_hamm/idp/CG-Mapping-Benchmark",
                         help="Root directory to run commands from")
     parser.add_argument("--commands-file", type=str, default="commands.txt",
                         help="Path to the file containing command queue lines")
+    parser.add_argument("--past-commands-file", type=str, default="past_commands.txt",
+                        help="Path to the file where popped/executed commands are appended")
     parser.add_argument("--interval", type=int, default=60,
                         help="Check interval in seconds when no GPUs are free or queue is empty")
     parser.add_argument("--wait-after-start", type=int, default=60,
@@ -173,6 +203,10 @@ def main():
                         help="Path to the runner log file")
     parser.add_argument("--ignored-process", type=str, default="gmx",
                         help="Process name keyword to ignore on GPUs")
+    parser.add_argument("--max-memory-mb", type=float, default=2048,
+                        help="Maximum allowed GPU memory usage in MB to consider GPU free (default: 2048)")
+    parser.add_argument("--max-gpu-util", type=float, default=20,
+                        help="Maximum allowed GPU utilization percentage to consider GPU free (default: 20)")
     parser.add_argument("--keep-alive", action="store_true",
                         help="Keep the runner running even when the queue is empty")
     
@@ -181,6 +215,7 @@ def main():
     root_dir = os.path.abspath(os.path.expanduser(args.root_dir))
     log_file_path = os.path.abspath(os.path.expanduser(args.log_file))
     commands_file_path = os.path.abspath(os.path.expanduser(args.commands_file))
+    past_commands_file_path = os.path.abspath(os.path.expanduser(args.past_commands_file))
     script_dir = os.path.dirname(os.path.abspath(__file__))
     logs_dir = os.path.join(script_dir, "runner_logs")
     os.makedirs(logs_dir, exist_ok=True)
@@ -188,7 +223,7 @@ def main():
     setup_logging(log_file_path)
     
     logging.info("Starting GPU Queue Runner...")
-    logging.info(f"Config: root_dir={root_dir}, commands_file={commands_file_path}, interval={args.interval}s, wait_after_start={args.wait_after_start}s, ignored_process='{args.ignored_process}', keep_alive={args.keep_alive}")
+    logging.info(f"Config: root_dir={root_dir}, commands_file={commands_file_path}, past_commands_file={past_commands_file_path}, interval={args.interval}s, wait_after_start={args.wait_after_start}s, ignored_process='{args.ignored_process}', max_memory_mb={args.max_memory_mb}, max_gpu_util={args.max_gpu_util}%, keep_alive={args.keep_alive}")
     
     if not os.path.isdir(root_dir):
         logging.error(f"Root directory does not exist: {root_dir}")
@@ -215,7 +250,7 @@ def main():
             time.sleep(args.interval)
             continue
             
-        free_gpus = get_free_gpus(args.ignored_process)
+        free_gpus = get_free_gpus(args.ignored_process, max_memory_mb=args.max_memory_mb, max_gpu_util=args.max_gpu_util)
         
         if not free_gpus:
             logging.info("No free GPUs available. Waiting...")
@@ -229,6 +264,7 @@ def main():
             logging.info("Could not fetch command from queue (might have been removed). Retrying...")
             continue
             
+        append_past_command(command, past_commands_file_path)
         logging.info(f"Found free GPU(s): {free_gpus}. Selected GPU {chosen_gpu}.")
         
         wrapped_command, log_filepath = wrap_command_nohup(command, logs_dir, chosen_gpu)
@@ -236,6 +272,7 @@ def main():
         
         env = os.environ.copy()
         env["GPU_CHOICE"] = str(chosen_gpu)
+        env["CUDA_VISIBLE_DEVICES"] = str(chosen_gpu)
         
         try:
             subprocess.Popen(

@@ -10,24 +10,14 @@ if viz_dir not in sys.path:
     sys.path.insert(0, viz_dir)
 
 try:
-    from viz import visualize_mapping_grid
-    from rdkit import Chem
+    from viz import visualize_mapping, visualize_mapping_grid, get_molecule_with_node_ordering
 except ImportError as e:
-    print(f"[ERROR] Could not import required packages: {e}")
-    print("[ERROR] Please make sure rdkit and other dependencies are installed in your environment.")
+    print(f"[ERROR] Could not import required viz package: {e}")
     sys.exit(1)
 
-MOLECULE_SMILES = {
-    "ala2": "CC(=O)N[C@@H](C)C(=O)NC",
-    "hexane": "CCCCCC",
-    "pro2": "CC(=O)N1CCC[C@H]1C(=O)NC",
-    "thr2": "CC(=O)N[C@@H]([C@H](O)C)C(=O)NC",
-    "gly2": "CC(=O)NCC(=O)NC",
-    "ala15": "CC(=O)" + "N[C@@H](C)C(=O)" * 15 + "NC",
-}
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate CG maps visualization from cg_maps.json")
+    parser = argparse.ArgumentParser(description="Generate CG maps visualization from cg_maps.json or mapping array")
     parser.add_argument(
         "--cg-maps",
         type=str,
@@ -37,12 +27,12 @@ def main():
     parser.add_argument(
         "--mol",
         type=str,
-        help="Molecule name (e.g. ala2, hexane, pro2, thr2, gly2, ala15). If not specified, the script tries to read it from config.json in the same directory."
+        help="Molecule name (e.g. ala2, hexane, pro2, thr2, gly2, ala15). If not specified, tries to read it from config.json in the same directory."
     )
     parser.add_argument(
         "--output",
         type=str,
-        help="Path to save the generated PNG. Defaults to cg_maps_over_time.png in the same directory as cg_maps.json"
+        help="Path to save the generated PNG."
     )
     parser.add_argument(
         "--num-beads",
@@ -72,14 +62,13 @@ def main():
         print("[ERROR] cg_maps.json is empty.")
         sys.exit(1)
 
-    # In JSON, keys are strings, convert to integer epochs
+    # Convert epoch keys to integers if possible, else keep string keys
     try:
         saved_cg_maps = {int(k): v for k, v in saved_cg_maps.items()}
-    except ValueError as e:
-        print(f"[ERROR] Epoch keys in cg_maps.json must be integers: {e}")
-        sys.exit(1)
+        sorted_epochs = sorted(saved_cg_maps.keys())
+    except ValueError:
+        sorted_epochs = list(saved_cg_maps.keys())
 
-    sorted_epochs = sorted(saved_cg_maps.keys())
     mappings = [saved_cg_maps[ep] for ep in sorted_epochs]
 
     # Infer mol_name if not specified
@@ -94,36 +83,17 @@ def main():
                 print(f"[INFO] Inferred molecule '{mol_name}' from {config_path}")
             except Exception as e:
                 print(f"[WARNING] Failed to read {config_path}: {e}")
-        else:
-            print(f"[WARNING] config.json not found in {os.path.dirname(cg_maps_path)}")
 
     if not mol_name:
         print("[ERROR] Molecule name could not be inferred. Please specify it using --mol.")
         sys.exit(1)
 
-    # Get SMILES
-    mol_name_lower = mol_name.lower()
-    smiles = MOLECULE_SMILES.get(mol_name_lower)
-    if not smiles:
-        print(f"[ERROR] SMILES not found for molecule '{mol_name}'. Available molecules: {list(MOLECULE_SMILES.keys())}")
-        sys.exit(1)
-
-    # Construct molecule
+    # Get molecule structure with canonical node ordering
     try:
-        mol = Chem.MolFromSmiles(smiles)
-        mol = Chem.AddHs(mol)
+        mol = get_molecule_with_node_ordering(mol_name)
     except Exception as e:
-        print(f"[ERROR] Failed to build molecule structure from SMILES: {e}")
+        print(f"[ERROR] Failed to prepare molecule '{mol_name}': {e}")
         sys.exit(1)
-
-    # Renumber if it's ala2 (matching the renumbering in viz.py/run_mace_training.py)
-    if mol_name_lower == "ala2":
-        permutation = [0,10,11,12,1,2,3,13,4,14,5,15,16,17,6,7,8,18,9,19,20,21]
-        try:
-            mol = Chem.RenumberAtoms(mol, permutation)
-            print(f"[INFO] Renumbered atoms for {mol_name} using permutation.")
-        except Exception as e:
-            print(f"[WARNING] Failed to renumber atoms for {mol_name}: {e}")
 
     # Determine num_cg_beads
     if args.num_beads is not None:
@@ -135,25 +105,99 @@ def main():
             if valid_indices:
                 max_bead = max(max_bead, max(valid_indices))
         num_cg_beads = max_bead + 1
-    print(f"[INFO] Number of CG beads: {num_cg_beads}")
 
-    # Set up arguments for visualize_mapping_grid
-    legends = [f"Epoch {ep}" for ep in sorted_epochs]
-    epoch_species = [list(range(num_cg_beads)) for _ in sorted_epochs]
+    # Resolve species list accurately across static, custom, and learned maps
+    species_list = None
+
+    # 1. Read config.json if available
+    config = {}
+    config_path = os.path.join(os.path.dirname(cg_maps_path), "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to read {config_path}: {e}")
+
+    # 2. Check if cg_species is stored directly in config.json
+    if "cg_species" in config and isinstance(config["cg_species"], (list, tuple)):
+        species_list = list(config["cg_species"])
+        print(f"[INFO] Using cg_species from config.json: {species_list}")
+    elif config.get("unique_cg_species", False):
+        species_list = list(range(1, num_cg_beads + 1))
+        print(f"[INFO] Using unique_cg_species 1..{num_cg_beads}")
+
+    # 3. Otherwise try to infer species from cgbench mapping definitions
+    if species_list is None:
+        try:
+            scripts_dir = os.path.abspath(os.path.dirname(__file__))
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            root_dir = os.path.abspath(os.path.join(scripts_dir, "../.."))
+            if root_dir not in sys.path:
+                sys.path.insert(0, root_dir)
+
+            from cgbench.core import mapping as cg_mapping
+            from cgbench.core.mapping import register_custom_map
+
+            mol_name_map = {
+                "ala2": "Ala2_Map",
+                "ala15": "Ala15_Map",
+                "hexane": "Hexane_Map",
+                "pro2": "Pro2_Map",
+                "thr2": "Thr2_Map",
+                "gly2": "Gly2_Map",
+            }
+            if mol_name.lower() in mol_name_map:
+                map_cls_name = mol_name_map[mol_name.lower()]
+                map_cls = getattr(cg_mapping, map_cls_name, None)
+                if map_cls is not None:
+                    map_inst = map_cls()
+                    cg_map_name = config.get("CG_map", "hmerged")
+                    if cg_map_name == "learned":
+                        cg_map_name = "hmerged"
+
+                    # If custom CG map, register custom map to get inherited species
+                    if (cg_map_name == "custom" or len(mappings) == 1) and mappings:
+                        register_custom_map(map_inst, mappings[0])
+                        cg_map_name = "custom"
+
+                    if cg_map_name in map_inst.get_available_maps():
+                        _, inferred_species, _, _ = map_inst.get_map(cg_map_name)
+                        species_list = list(inferred_species)
+                        print(f"[INFO] Inferred species for map '{cg_map_name}': {species_list}")
+        except Exception as e:
+            print(f"[WARNING] Could not infer species from map definition: {e}")
+
+    # 4. Fallback to 1..num_cg_beads if all else fails
+    if species_list is None:
+        species_list = list(range(1, num_cg_beads + 1))
+        print(f"[INFO] Falling back to default species 1..{num_cg_beads}")
+
+    epoch_species = [species_list for _ in sorted_epochs]
 
     # Output path
     output_image_path = args.output
     if not output_image_path:
-        output_image_path = os.path.join(os.path.dirname(cg_maps_path), "cg_maps_over_time.png")
+        out_dir = os.path.dirname(cg_maps_path)
+        if len(mappings) > 1:
+            output_image_path = os.path.join(out_dir, "cg_maps_over_time.png")
+        else:
+            output_image_path = os.path.join(out_dir, "cg_map.png")
 
     # Generate visualization
     try:
         print(f"[INFO] Generating visualization and saving to: {output_image_path}")
-        visualize_mapping_grid(mol, mappings, legends, epoch_species, output_image_path)
-        print("[INFO] Successfully generated CG maps visualization!")
+        if len(mappings) == 1:
+            visualize_mapping(mol, mappings[0], output_image_path, species=epoch_species[0], legend=f"CG Map ({mol_name})")
+        else:
+            legends = [f"Epoch {ep}" for ep in sorted_epochs]
+            visualize_mapping_grid(mol, mappings, legends, epoch_species, output_image_path)
+        print("[INFO] Successfully generated CG map visualization!")
     except Exception as e:
         print(f"[ERROR] Failed to generate visualization: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

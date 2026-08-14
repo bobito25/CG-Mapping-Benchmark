@@ -44,9 +44,11 @@ DEFAULT_MACE_CONFIG = {
     "val_ratio": 0.1,  # Ratio of validation data, (Train_ratio + Val_ratio <= 1.0, rest is test data)
     "PRNGKey_seed": SEED,
     "learned_species_embedding": False,
+    "normalize_atom_embedding": False,
     "species_embedding_dim": 16,
     "use_direct_force_mapping": True,
     "freeze_cg_after_epoch": None,
+    "cg_init": "random",
 }
 
 DEFAULT_NEQUIP_CONFIG = {
