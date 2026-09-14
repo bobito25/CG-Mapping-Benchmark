@@ -7,13 +7,14 @@ from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
         self.atom_masses = jnp.asarray(atom_masses, dtype=jnp.float32)
         self.freeze_cg = freeze_cg
         self.empty_bead_penalty_weight = empty_bead_penalty_weight
+        self.intra_bead_distance_weight = intra_bead_distance_weight
         self.temperature = 1.0
         self.use_direct_force_mapping = use_direct_force_mapping
         self.learned_species_embedding = learned_species_embedding
@@ -130,6 +131,25 @@ class CGForceMatching(ForceMatching):
             predictions['cg_mask'] = cg_mask
             predictions['R_cg'] = R_cg
             predictions['assignments'] = assignments
+
+            # Compute intra-bead spatial dispersion if weight is positive
+            if self.intra_bead_distance_weight > 0.0:
+                def frame_dispersion(r_cg, r_at, assign):
+                    disp = jax.vmap(lambda r_bead: jax.vmap(lambda r_node: displacement_fn_cart(r_node, r_bead))(r_at))(r_cg)
+                    dist_sq = jnp.sum(disp ** 2, axis=-1)  # (num_cg_beads, n_atoms)
+                    assign_t = jnp.swapaxes(assign, -1, -2)  # (num_cg_beads, n_atoms)
+                    bead_counts = jnp.sum(assign_t, axis=-1)  # (num_cg_beads,)
+                    bead_sq_sum = jnp.sum(assign_t * dist_sq, axis=-1)  # (num_cg_beads,)
+                    safe_counts = jnp.maximum(bead_counts, 1e-4)
+                    bead_var = bead_sq_sum / safe_counts  # (num_cg_beads,)
+                    active_mask = bead_counts > 0.5
+                    num_active = jnp.maximum(jnp.sum(active_mask), 1.0)
+                    return jnp.sum(bead_var * active_mask) / num_active
+
+                frame_disp_fn = lambda r_cg, r_at, assign: frame_dispersion(r_cg, r_at, assign)
+                batch_dispersions = jax.vmap(frame_disp_fn)(R_cg_cart, R_cart, assignments)
+                predictions['intra_bead_dispersion'] = batch_dispersions
+
             return predictions
 
         # Create a custom loss that looks at the mapped targets instead of the original batch targets
@@ -166,6 +186,14 @@ class CGForceMatching(ForceMatching):
                 corrected_loss = corrected_loss + loss_penalty
                 errors['empty_bead_penalty'] = empty_bead_penalty
                 errors['empty_bead_loss'] = loss_penalty
+
+            # Add intra-bead distance penalty if weight is positive and dispersion is computed
+            if 'intra_bead_dispersion' in predictions and self.intra_bead_distance_weight > 0.0:
+                intra_disp = jnp.mean(predictions['intra_bead_dispersion'])
+                intra_loss = self.intra_bead_distance_weight * intra_disp
+                corrected_loss = corrected_loss + intra_loss
+                errors['intra_bead_dispersion'] = intra_disp
+                errors['intra_bead_loss'] = intra_loss
 
             return corrected_loss, errors
 

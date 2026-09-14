@@ -517,6 +517,472 @@ def plot_atom_embeddings_grid(saved_atom_embeddings: dict, out_dir: str) -> None
         print(f"[WARNING] Could not save normalized atom embeddings grid: {e}")
 
 
+def plot_atom_and_cg_embeddings_pca(
+    saved_atom_embeddings: dict,
+    saved_cg_maps: dict,
+    out_dir: str,
+    mol_name: str = "ala2",
+    epoch: int | None = None,
+    save_prefix: str = "atom_and_cg_embeddings_pca",
+) -> None:
+    """
+    Visualize learned atom embeddings as vectors and combined CG bead embeddings
+    in the same PCA projection for a given epoch (default: final epoch).
+
+    Parameters
+    ----------
+    saved_atom_embeddings : dict
+        Dict mapping epoch (int or str) -> {str(spec): list of float embeddings}
+    saved_cg_maps : dict
+        Dict mapping epoch (int or str) -> list of int bead assignments per atom
+    out_dir : str
+        Output directory to save the plots
+    mol_name : str, optional
+        Molecule name ('ala2', 'ala15', 'hexane', etc.), by default 'ala2'
+    epoch : int, optional
+        Epoch to visualize. If None, the final epoch is used.
+    save_prefix : str, optional
+        Prefix for output filenames, by default 'atom_and_cg_embeddings_pca'
+    """
+    import os
+    from mpl_toolkits.mplot3d import Axes3D
+
+    if not saved_atom_embeddings or not saved_cg_maps:
+        print("[WARNING] Missing saved_atom_embeddings or saved_cg_maps for PCA visualization.")
+        return
+
+    # Determine epoch to plot
+    common_epochs = sorted(
+        list(set(int(k) for k in saved_atom_embeddings.keys()) & set(int(k) for k in saved_cg_maps.keys()))
+    )
+    if not common_epochs:
+        print("[WARNING] No overlapping epochs between saved_atom_embeddings and saved_cg_maps.")
+        return
+
+    if epoch is None or int(epoch) not in common_epochs:
+        target_epoch = common_epochs[-1]
+    else:
+        target_epoch = int(epoch)
+
+    ep_atom_data = saved_atom_embeddings.get(target_epoch) or saved_atom_embeddings.get(str(target_epoch))
+    ep_cg_map = saved_cg_maps.get(target_epoch) or saved_cg_maps.get(str(target_epoch))
+
+    if ep_atom_data is None or ep_cg_map is None:
+        print(f"[WARNING] Data for epoch {target_epoch} not found.")
+        return
+
+    # Extract unique atom species and embeddings
+    species_order = sorted([int(k) for k in ep_atom_data.keys()])
+    species_symbols = {s: ATOMIC_NUMBER_TO_SYMBOL.get(s, f"S_{s}") for s in species_order}
+    species_colors_palette = {
+        1: "#0096C7",  # Hydrogen: Sky Blue
+        6: "#212529",  # Carbon: Charcoal / Near Black
+        7: "#3A0CA3",  # Nitrogen: Deep Indigo
+        8: "#D90429",  # Oxygen: Vivid Crimson Red
+    }
+    species_colors = {
+        s: species_colors_palette.get(s, plt.cm.tab10(idx % 10))
+        for idx, s in enumerate(species_order)
+    }
+
+    E_atoms = np.array([ep_atom_data[str(s)] if str(s) in ep_atom_data else ep_atom_data[s] for s in species_order])
+    num_atoms = len(ep_cg_map)
+
+    # Determine atom species sequence for the molecule
+    mol_species = None
+    try:
+        from cgbench.core import mapping
+        map_class_name = f"{mol_name.capitalize()}_Map"
+        map_class = getattr(mapping, map_class_name, None)
+        if map_class is not None and hasattr(map_class, "map_species"):
+            raw_specs = map_class.map_species
+            mol_species = [mapping.atomic_number_map_reverse.get(s, s) for s in raw_specs]
+    except Exception:
+        pass
+
+    if mol_species is None or len(mol_species) != num_atoms:
+        if num_atoms == 22:
+            mol_species = [6, 1, 1, 1, 6, 8, 7, 1, 6, 1, 6, 1, 1, 1, 6, 8, 7, 1, 6, 1, 1, 1]
+        elif num_atoms == 20:
+            mol_species = [6, 1, 1, 1, 6, 1, 1, 6, 1, 1, 6, 1, 1, 6, 1, 1, 6, 1, 1, 1]
+        else:
+            mol_species = [species_order[0]] * num_atoms
+
+    # Compute CG bead combined embeddings (vector sum of constituent atom embeddings)
+    num_beads = max(ep_cg_map) + 1 if ep_cg_map else 0
+    emb_dim = E_atoms.shape[1]
+    E_beads = np.zeros((num_beads, emb_dim))
+    bead_info = {}
+
+    for b in range(num_beads):
+        atoms_in_b = [i for i, b_idx in enumerate(ep_cg_map) if b_idx == b]
+        specs = [mol_species[i] for i in atoms_in_b]
+        spec_counts = {species_symbols[s]: specs.count(s) for s in set(specs)}
+        comp_str = "".join([f"{k}{v if v > 1 else ''}" for k, v in sorted(spec_counts.items())])
+        bead_info[b] = {
+            "atoms": atoms_in_b,
+            "species": specs,
+            "comp": comp_str or "Empty",
+            "is_empty": len(atoms_in_b) == 0,
+        }
+        for s in specs:
+            if s in species_order:
+                E_beads[b] += E_atoms[species_order.index(s)]
+
+    # SVD on atom embeddings for origin-preserving PCA (preserves linear vector addition)
+    u, s_vals, vt = np.linalg.svd(E_atoms, full_matrices=False)
+    n_comp = min(3, len(s_vals))
+    W = vt[:n_comp].T
+    var_exp = (s_vals**2) / np.sum(s_vals**2)
+
+    proj_atoms = E_atoms @ W
+    proj_beads = E_beads @ W
+
+    # Group beads with identical 2D coordinates
+    grouped_beads = {}
+    for b in range(num_beads):
+        if bead_info[b]["is_empty"]:
+            continue
+        key = (round(float(proj_beads[b, 0]), 4), round(float(proj_beads[b, 1]), 4))
+        if key not in grouped_beads:
+            grouped_beads[key] = []
+        grouped_beads[key].append(b)
+
+    bead_colors = ["#F72585", "#7209B7", "#4CC9F0", "#F77F00", "#06D6A0", "#FB8500", "#118AB2", "#8338EC", "#2EC4B6", "#E71D36"]
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ----------------------------------------------------
+    # 1. STANDALONE 2D VECTOR PLOT
+    # ----------------------------------------------------
+    fig2d, ax2d = plt.subplots(figsize=(11, 10), dpi=300)
+    ax2d.set_facecolor("#FAFAFC")
+
+    all_x = np.concatenate([proj_atoms[:, 0], proj_beads[:, 0], [0]])
+    all_y = np.concatenate([proj_atoms[:, 1], proj_beads[:, 1], [0]])
+    pad_x = (all_x.max() - all_x.min()) * 0.20
+    pad_y = (all_y.max() - all_y.min()) * 0.25
+    ax2d.set_xlim(all_x.min() - pad_x, all_x.max() + pad_x)
+    ax2d.set_ylim(all_y.min() - pad_y, all_y.max() + pad_y)
+
+    ax2d.axhline(0, color="#ADB5BD", linestyle="--", linewidth=1.2, alpha=0.7, zorder=1)
+    ax2d.axvline(0, color="#ADB5BD", linestyle="--", linewidth=1.2, alpha=0.7, zorder=1)
+    ax2d.scatter(0, 0, color="#212529", s=60, zorder=5)
+    ax2d.text(0.02, -0.04, "(0, 0)", fontsize=10, color="#6C757D", fontweight="semibold")
+
+    # Vector Addition Guides for Composite Beads
+    for b in range(num_beads):
+        if bead_info[b]["is_empty"]:
+            continue
+        specs = bead_info[b]["species"]
+        bx, by = proj_beads[b, :2]
+        if len(specs) == 2 and all(s in species_order for s in specs):
+            p1 = proj_atoms[species_order.index(specs[0]), :2]
+            p2 = proj_atoms[species_order.index(specs[1]), :2]
+            ax2d.plot([p1[0], bx], [p1[1], by], linestyle=":", color=species_colors[specs[1]], lw=1.8, alpha=0.8, zorder=2)
+            ax2d.plot([p2[0], bx], [p2[1], by], linestyle=":", color=species_colors[specs[0]], lw=1.8, alpha=0.8, zorder=2)
+        elif len(specs) > 2 and len(set(specs)) == 2:
+            heavy = [s for s in specs if s != 1]
+            if heavy and 1 in specs:
+                h_s = heavy[0]
+                h_coord = proj_atoms[species_order.index(1), :2]
+                base_coord = proj_atoms[species_order.index(h_s), :2]
+                curr = base_coord.copy()
+                step_pts = [curr.copy()]
+                for _ in range(specs.count(1)):
+                    curr += h_coord
+                    step_pts.append(curr.copy())
+                step_pts = np.array(step_pts)
+                ax2d.plot(step_pts[:, 0], step_pts[:, 1], linestyle="--", color=species_colors[1], lw=1.4, alpha=0.5, zorder=2)
+
+    # Plot Atom Vectors
+    for idx, s in enumerate(species_order):
+        sym = species_symbols[s]
+        col = species_colors[s]
+        x, y = proj_atoms[idx, 0], proj_atoms[idx, 1]
+        ax2d.annotate(
+            "", xy=(x, y), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->,head_width=0.5,head_length=0.7", lw=3.8, color=col, alpha=0.95),
+            zorder=4,
+        )
+        ha = "left" if x >= 0 else "right"
+        va = "bottom" if y >= 0 else "top"
+        offset_x = 0.05 if x >= 0 else -0.05
+        offset_y = 0.04 if y >= 0 else -0.04
+        if s == 7:  # N points down
+            offset_y = -0.06
+            offset_x = 0.0
+            va = "top"
+            ha = "center"
+        elif s == 1:  # H points left-down
+            offset_x = -0.05
+            offset_y = -0.03
+            ha = "right"
+            va = "top"
+
+        ax2d.text(
+            x + offset_x, y + offset_y,
+            sym,
+            fontsize=15, fontweight="bold", color=col,
+            ha=ha, va=va, zorder=6,
+        )
+
+    # Plot Bead Vectors and Endpoints
+    for i, (coord, b_list) in enumerate(grouped_beads.items()):
+        bx, by = coord
+        first_b = b_list[0]
+        comp = bead_info[first_b]["comp"]
+        b_color = bead_colors[i % len(bead_colors)]
+        is_single_atom = any(np.allclose([bx, by], proj_atoms[a_idx, :2], atol=1e-3) for a_idx in range(len(species_order)))
+
+        if not is_single_atom:
+            ax2d.annotate(
+                "", xy=(bx, by), xytext=(0, 0),
+                arrowprops=dict(arrowstyle="->,head_width=0.35,head_length=0.55", lw=2.2, color=b_color, linestyle="-", alpha=0.8),
+                zorder=3,
+            )
+            marker = "D"
+            size = 130
+        else:
+            marker = "o"
+            size = 140
+
+        ax2d.scatter(bx, by, s=size, color=b_color, edgecolor="white", linewidth=1.8, zorder=5, marker=marker)
+
+        # If identical to a single atom (e.g. single H), skip redundant label
+        if is_single_atom:
+            continue
+
+        ha = "left" if bx >= 0 else "right"
+        va = "bottom" if by >= 0 else "top"
+        offset_bx = 0.05 if bx >= 0 else -0.05
+        offset_by = 0.04 if by >= 0 else -0.04
+
+        if comp == "CO":
+            offset_by = 0.05
+            offset_bx = 0.0
+            va = "bottom"
+            ha = "center"
+        elif comp == "CNO":
+            offset_by = -0.05
+            offset_bx = -0.05
+            va = "top"
+            ha = "right"
+        elif comp == "CHN":
+            offset_bx = 0.05
+            offset_by = -0.05
+            va = "top"
+            ha = "left"
+        elif comp == "CH3":
+            offset_bx = -0.05
+            offset_by = 0.04
+            ha = "right"
+            va = "bottom"
+        elif comp == "CH":
+            offset_bx = 0.05
+            offset_by = 0.04
+            ha = "left"
+            va = "bottom"
+
+        ax2d.text(
+            bx + offset_bx, by + offset_by,
+            comp,
+            fontsize=13, fontweight="bold", color=b_color,
+            ha=ha, va=va, zorder=6,
+        )
+
+    ax2d.set_title(f"Atom & Combined CG Bead Embeddings in PCA Space (Epoch {target_epoch})", fontsize=15, fontweight="bold", pad=15)
+    ax2d.set_xlabel(f"Principal Component 1 ({var_exp[0]*100:.1f}% Variance)", fontsize=12, fontweight="semibold")
+    ax2d.set_ylabel(f"Principal Component 2 ({var_exp[1]*100:.1f}% Variance)", fontsize=12, fontweight="semibold")
+    ax2d.grid(True, linestyle=":", color="#CED4DA", alpha=0.7)
+    plt.tight_layout()
+
+    out_file_2d = f"{out_dir}/{save_prefix}_2d.png"
+    fig2d.savefig(out_file_2d, dpi=300, bbox_inches="tight")
+    plt.close(fig2d)
+    print(f"[INFO] Saved 2D PCA vector plot to {out_file_2d}")
+
+    # ----------------------------------------------------
+    # 2. MULTI-PANEL FIGURE (2D Vector Space + 3D + Cosine Sim)
+    # ----------------------------------------------------
+    fig = plt.figure(figsize=(18, 9), dpi=300)
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.2, 0.8], height_ratios=[1, 1], hspace=0.3, wspace=0.25)
+
+    ax_main = fig.add_subplot(gs[:, 0])
+    ax_main.set_facecolor("#FAFAFC")
+    ax_main.set_xlim(all_x.min() - pad_x, all_x.max() + pad_x)
+    ax_main.set_ylim(all_y.min() - pad_y, all_y.max() + pad_y)
+    ax_main.axhline(0, color="#ADB5BD", linestyle="--", linewidth=1.2, alpha=0.7, zorder=1)
+    ax_main.axvline(0, color="#ADB5BD", linestyle="--", linewidth=1.2, alpha=0.7, zorder=1)
+    ax_main.scatter(0, 0, color="#212529", s=60, zorder=5)
+
+    # Re-plot guides on multi-panel
+    for b in range(num_beads):
+        if bead_info[b]["is_empty"]:
+            continue
+        specs = bead_info[b]["species"]
+        bx, by = proj_beads[b, :2]
+        if len(specs) == 2 and all(s in species_order for s in specs):
+            p1 = proj_atoms[species_order.index(specs[0]), :2]
+            p2 = proj_atoms[species_order.index(specs[1]), :2]
+            ax_main.plot([p1[0], bx], [p1[1], by], linestyle=":", color=species_colors[specs[1]], lw=1.8, alpha=0.8, zorder=2)
+            ax_main.plot([p2[0], bx], [p2[1], by], linestyle=":", color=species_colors[specs[0]], lw=1.8, alpha=0.8, zorder=2)
+        elif len(specs) > 2 and len(set(specs)) == 2:
+            heavy = [s for s in specs if s != 1]
+            if heavy and 1 in specs:
+                h_s = heavy[0]
+                h_coord = proj_atoms[species_order.index(1), :2]
+                base_coord = proj_atoms[species_order.index(h_s), :2]
+                curr = base_coord.copy()
+                step_pts = [curr.copy()]
+                for _ in range(specs.count(1)):
+                    curr += h_coord
+                    step_pts.append(curr.copy())
+                step_pts = np.array(step_pts)
+                ax_main.plot(step_pts[:, 0], step_pts[:, 1], linestyle="--", color=species_colors[1], lw=1.4, alpha=0.5, zorder=2)
+
+    for idx, s in enumerate(species_order):
+        sym = species_symbols[s]
+        col = species_colors[s]
+        x, y = proj_atoms[idx, 0], proj_atoms[idx, 1]
+        ax_main.annotate("", xy=(x, y), xytext=(0, 0), arrowprops=dict(arrowstyle="->,head_width=0.45,head_length=0.65", lw=3.5, color=col, alpha=0.95), zorder=4)
+        ha = "left" if x >= 0 else "right"
+        va = "bottom" if y >= 0 else "top"
+        offset_x = 0.05 if x >= 0 else -0.05
+        offset_y = 0.04 if y >= 0 else -0.04
+        if s == 7:
+            offset_y = -0.06
+            offset_x = 0.0
+            va = "top"
+            ha = "center"
+        elif s == 1:
+            offset_x = -0.05
+            offset_y = -0.03
+            ha = "right"
+            va = "top"
+        ax_main.text(x + offset_x, y + offset_y, sym, fontsize=14, fontweight="bold", color=col, ha=ha, va=va, zorder=6)
+
+    for i, (coord, b_list) in enumerate(grouped_beads.items()):
+        bx, by = coord
+        first_b = b_list[0]
+        comp = bead_info[first_b]["comp"]
+        b_color = bead_colors[i % len(bead_colors)]
+        is_single_atom = any(np.allclose([bx, by], proj_atoms[a_idx, :2], atol=1e-3) for a_idx in range(len(species_order)))
+        if not is_single_atom:
+            ax_main.annotate("", xy=(bx, by), xytext=(0, 0), arrowprops=dict(arrowstyle="->,head_width=0.32,head_length=0.5", lw=2.0, color=b_color, alpha=0.8), zorder=3)
+            marker = "D"
+            size = 120
+        else:
+            marker = "o"
+            size = 130
+        ax_main.scatter(bx, by, s=size, color=b_color, edgecolor="white", linewidth=1.8, zorder=5, marker=marker)
+
+        if is_single_atom:
+            continue
+
+        ha = "left" if bx >= 0 else "right"
+        va = "bottom" if by >= 0 else "top"
+        offset_bx = 0.05 if bx >= 0 else -0.05
+        offset_by = 0.04 if by >= 0 else -0.04
+        if comp == "CO":
+            offset_by = 0.05
+            offset_bx = 0.0
+            va = "bottom"
+            ha = "center"
+        elif comp == "CNO":
+            offset_by = -0.05
+            offset_bx = -0.05
+            va = "top"
+            ha = "right"
+        elif comp == "CHN":
+            offset_bx = 0.05
+            offset_by = -0.05
+            va = "top"
+            ha = "left"
+        elif comp == "CH3":
+            offset_bx = -0.05
+            offset_by = 0.04
+            ha = "right"
+            va = "bottom"
+        elif comp == "CH":
+            offset_bx = 0.05
+            offset_by = 0.04
+            ha = "left"
+            va = "bottom"
+
+        ax_main.text(bx + offset_bx, by + offset_by, comp, fontsize=12, fontweight="bold", color=b_color, ha=ha, va=va, zorder=6)
+
+    ax_main.set_title("A. 2D PCA Vector Space (Origin-Preserving)", fontsize=13, fontweight="bold")
+    ax_main.set_xlabel(f"PC 1 ({var_exp[0]*100:.1f}% Variance)", fontsize=11, fontweight="semibold")
+    ax_main.set_ylabel(f"PC 2 ({var_exp[1]*100:.1f}% Variance)", fontsize=11, fontweight="semibold")
+    ax_main.grid(True, linestyle=":", color="#CED4DA", alpha=0.7)
+
+    # Panel B: 3D PCA Projection
+    ax3d = fig.add_subplot(gs[0, 1], projection="3d")
+    ax3d.view_init(elev=22, azim=45)
+    ax3d.scatter([0], [0], [0], color="black", s=30)
+    for idx, s in enumerate(species_order):
+        sym = species_symbols[s]
+        col = species_colors[s]
+        p = proj_atoms[idx]
+        pz = p[2] if len(p) > 2 else 0.0
+        ax3d.quiver(0, 0, 0, p[0], p[1], pz, color=col, lw=2.5, arrow_length_ratio=0.15, alpha=0.9)
+        ax3d.text(p[0] * 1.15, p[1] * 1.15, pz * 1.15, sym, color=col, fontsize=11, fontweight="bold")
+
+    for i, (coord, b_list) in enumerate(grouped_beads.items()):
+        first_b = b_list[0]
+        comp = bead_info[first_b]["comp"]
+        b_color = bead_colors[i % len(bead_colors)]
+        p = proj_beads[first_b]
+        pz = p[2] if len(p) > 2 else 0.0
+        is_single_atom = any(np.allclose(p[:2], proj_atoms[a_idx, :2], atol=1e-3) for a_idx in range(len(species_order)))
+        if not is_single_atom:
+            ax3d.quiver(0, 0, 0, p[0], p[1], pz, color=b_color, lw=1.5, linestyle=":", arrow_length_ratio=0.12, alpha=0.7)
+            marker = "D"
+            ax3d.text(p[0] * 1.08, p[1] * 1.08, pz * 1.08, comp, fontsize=9, fontweight="bold", color=b_color)
+        else:
+            marker = "o"
+        ax3d.scatter(p[0], p[1], pz, color=b_color, s=70, edgecolor="black", marker=marker)
+
+    var_3d = float(np.sum(var_exp[:3])) * 100
+    ax3d.set_title(f"B. 3D PCA Space ({var_3d:.1f}% Variance Captured)", fontsize=13, fontweight="bold")
+    ax3d.set_xlabel("PC 1", fontsize=9)
+    ax3d.set_ylabel("PC 2", fontsize=9)
+    ax3d.set_zlabel("PC 3", fontsize=9)
+
+    # Panel C: Cosine Similarity Heatmap between Atoms and Unique Beads
+    ax_cos = fig.add_subplot(gs[1, 1])
+    unique_bead_indices = [b_list[0] for b_list in grouped_beads.values()]
+    unique_bead_labels = [bead_info[b_list[0]]["comp"] for b_list in grouped_beads.values()]
+
+    norm_atoms = E_atoms / np.maximum(np.linalg.norm(E_atoms, axis=-1, keepdims=True), 1e-8)
+    E_u_beads = E_beads[unique_bead_indices]
+    norm_beads = E_u_beads / np.maximum(np.linalg.norm(E_u_beads, axis=-1, keepdims=True), 1e-8)
+    cos_sim = norm_beads @ norm_atoms.T
+
+    im = ax_cos.imshow(cos_sim, cmap="coolwarm", vmin=-1.0, vmax=1.0, aspect="auto")
+    ax_cos.set_xticks(np.arange(len(species_order)))
+    ax_cos.set_xticklabels([species_symbols[s] for s in species_order], fontsize=11, fontweight="bold")
+    ax_cos.set_yticks(np.arange(len(unique_bead_labels)))
+    ax_cos.set_yticklabels(unique_bead_labels, fontsize=10.5, fontweight="bold")
+    ax_cos.set_title("C. Directional Cosine Similarity (Beads vs Atoms)", fontsize=13, fontweight="bold")
+
+    for r in range(cos_sim.shape[0]):
+        for c in range(cos_sim.shape[1]):
+            val = cos_sim[r, c]
+            txt_col = "white" if abs(val) > 0.55 else "black"
+            ax_cos.text(c, r, f"{val:.2f}", ha="center", va="center", color=txt_col, fontsize=9, fontweight="bold")
+
+    cbar = fig.colorbar(im, ax=ax_cos, shrink=0.85, pad=0.03)
+    cbar.set_label("Cosine Similarity", fontsize=9.5)
+
+    fig.suptitle(f"Learned Atom Embeddings & CG Bead Vector Composition ({mol_name.capitalize()}, Epoch {target_epoch})", fontsize=16, fontweight="bold", y=0.98)
+    out_multi = f"{out_dir}/{save_prefix}.png"
+    fig.savefig(out_multi, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] Saved multi-panel atom & CG bead embeddings PCA visualization to {out_multi}")
+
+
 def load_losses_from_dir(dir_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
     """
     Load train and val losses from a directory by checking trainer.pkl first,

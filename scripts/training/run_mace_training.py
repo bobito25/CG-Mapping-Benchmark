@@ -142,6 +142,18 @@ parser.add_argument(
     default=None,
     help="PRNG key seed for random initialization and dataset shuffling.",
 )
+parser.add_argument(
+    "--intra-bead-dist-weight",
+    type=float,
+    help="Weight for intra-bead atom distance regularizer (penalizes distant atoms in same bead)",
+    default=None,
+)
+parser.add_argument(
+    "--empty-bead-penalty-weight",
+    type=float,
+    help="Weight for empty bead penalty regularizer",
+    default=None,
+)
 args = parser.parse_args()
 
 device_choice = args.device or os.environ.get("GPU_CHOICE")
@@ -245,6 +257,12 @@ if args.gumbel_temp_3phase_timings is not None:
 if args.epochs is not None:
     TRAIN_CONFIG["num_epochs"] = args.epochs
 
+if args.intra_bead_dist_weight is not None:
+    TRAIN_CONFIG["intra_bead_distance_weight"] = args.intra_bead_dist_weight
+
+if args.empty_bead_penalty_weight is not None:
+    TRAIN_CONFIG["empty_bead_penalty_weight"] = args.empty_bead_penalty_weight
+
 freeze_after = MACE_CONFIG.get("freeze_cg_after_epoch", None)
 if (MACE_CONFIG["freeze_cg"] or freeze_after is not None) and MACE_CONFIG["CG_map"] != "learned":
     print("[WARNING] --freeze-cg or --freeze-cg-after-epoch was specified, but CG mapping choice is not 'learned'. Freezing has no effect.")
@@ -336,6 +354,10 @@ if MACE_CONFIG["CG_map"] == "learned":
         cg_init_suffix = f"_cginit={MACE_CONFIG.get('cg_init')}"
     else:
         cg_init_suffix = ""
+    if TRAIN_CONFIG.get("intra_bead_distance_weight", 0.0) > 0.0:
+        intra_dist_suffix = f"_intradist={TRAIN_CONFIG['intra_bead_distance_weight']}"
+    else:
+        intra_dist_suffix = ""
     print("[INFO] Gumbel temperature: ", TRAIN_CONFIG["gumbel_temp"])
 else:
     freeze_suffix = ""
@@ -343,9 +365,10 @@ else:
     direct_force_map_suffix = ""
     species_suffix = ""
     cg_init_suffix = ""
+    intra_dist_suffix = ""
 
 label_suffix = f"_{args.label}" if args.label is not None else ""
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}{intra_dist_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
 os.makedirs(output_dir, exist_ok=True)
 
 if MACE_CONFIG["CG_map"] == "learned":
@@ -712,6 +735,7 @@ if MACE_CONFIG["CG_map"] == "learned":
         atom_masses=masses,
         freeze_cg=MACE_CONFIG["freeze_cg"],
         empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0),
+        intra_bead_distance_weight=TRAIN_CONFIG.get("intra_bead_distance_weight", 0.0),
         use_direct_force_mapping=MACE_CONFIG["use_direct_force_mapping"],
         learned_species_embedding=MACE_CONFIG["learned_species_embedding"]
     )
@@ -916,6 +940,17 @@ if MACE_CONFIG["CG_map"] == "learned":
             plot_atom_embeddings_grid(trainer_fm.saved_atom_embeddings, output_dir)
         except Exception as e:
             print(f"[WARNING] Could not generate atom embeddings grid visualization: {e}")
+
+        try:
+            from cgbench.plotting.training import plot_atom_and_cg_embeddings_pca
+            plot_atom_and_cg_embeddings_pca(
+                saved_atom_embeddings=trainer_fm.saved_atom_embeddings,
+                saved_cg_maps=saved_cg_maps_dict,
+                out_dir=output_dir,
+                mol_name=MACE_CONFIG.get("mol", "ala2"),
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not generate atom and CG bead embeddings PCA visualization: {e}")
 
     if hasattr(trainer_fm, "saved_cg_gradients") and trainer_fm.saved_cg_gradients:
         cg_grads_path = f"{output_dir}/cg_gradients.json"

@@ -71,6 +71,7 @@ DEFAULT_TRAIN_CONFIG = {
     "gumbel_temp_3phase_points": [1.0, 0.4, 0.25, 0.1],
     "gumbel_temp_3phase_timings": [0.10, 0.90],
     "empty_bead_penalty_weight": 1000000.0,
+    "intra_bead_distance_weight": 0.0,
     "freeze_cg_after_epoch": None,
 }
 
