@@ -10,7 +10,7 @@ if viz_dir not in sys.path:
     sys.path.insert(0, viz_dir)
 
 try:
-    from viz import visualize_mapping, visualize_mapping_grid, get_molecule_with_node_ordering
+    from viz import visualize_mapping, visualize_mapping_grid, get_molecule_with_node_ordering, derive_cg_species
 except ImportError as e:
     print(f"[ERROR] Could not import required viz package: {e}")
     sys.exit(1)
@@ -174,7 +174,16 @@ def main():
         species_list = list(range(1, num_cg_beads + 1))
         print(f"[INFO] Falling back to default species 1..{num_cg_beads}")
 
-    epoch_species = [species_list for _ in sorted_epochs]
+    if config.get("learned_species_embedding", False):
+        epoch_species = derive_cg_species(
+            mol,
+            mappings,
+            reference_species=species_list,
+            num_beads=num_cg_beads,
+        )
+        print(f"[INFO] Learned species embedding enabled: dynamically derived CG species based on atom composition for {len(mappings)} mappings.")
+    else:
+        epoch_species = [species_list for _ in sorted_epochs]
 
     # Output path
     output_image_path = args.output

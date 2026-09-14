@@ -978,7 +978,7 @@ try:
     viz_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../mapping_viz"))
     if viz_dir not in sys.path:
         sys.path.insert(0, viz_dir)
-    from viz import visualize_mapping, visualize_mapping_grid, get_molecule_with_node_ordering
+    from viz import visualize_mapping, visualize_mapping_grid, get_molecule_with_node_ordering, derive_cg_species
 
     mol_name = MACE_CONFIG["mol"]
     mol = get_molecule_with_node_ordering(mol_name)
@@ -987,7 +987,17 @@ try:
         sorted_epochs = sorted(trainer_fm.saved_cg_maps.keys())
         mappings = [trainer_fm.saved_cg_maps[ep] for ep in sorted_epochs]
         legends = [f"Epoch {ep}" for ep in sorted_epochs]
-        epoch_species = [cg_species.tolist() for _ in sorted_epochs]
+
+        if MACE_CONFIG.get("learned_species_embedding", False):
+            epoch_species = derive_cg_species(
+                mol,
+                mappings,
+                reference_mapping=initial_mapping,
+                reference_species=cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species,
+            )
+            print("[INFO] Dynamically derived CG species per bead based on learned atom composition.")
+        else:
+            epoch_species = [cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species for _ in sorted_epochs]
 
         output_image_path = f"{output_dir}/cg_maps_over_time.png"
         visualize_mapping_grid(mol, mappings, legends, epoch_species, output_image_path)
@@ -1002,8 +1012,19 @@ try:
             map_to_plot = list(initial_mapping) if initial_mapping is not None else []
             legend_str = f"CG Map ({MACE_CONFIG['CG_map']})"
 
+        if MACE_CONFIG.get("learned_species_embedding", False) and map_to_plot:
+            plot_species = derive_cg_species(
+                mol,
+                map_to_plot,
+                reference_mapping=initial_mapping,
+                reference_species=cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species,
+            )
+            print("[INFO] Dynamically derived CG species for single map based on learned atom composition.")
+        else:
+            plot_species = cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species
+
         output_image_path = f"{output_dir}/cg_map.png"
-        visualize_mapping(mol, map_to_plot, output_image_path, species=cg_species.tolist(), legend=legend_str)
+        visualize_mapping(mol, map_to_plot, output_image_path, species=plot_species, legend=legend_str)
         print(f"[INFO] Saved CG map visualization to {output_image_path}")
 except Exception as e:
     print(f"[WARNING] Could not generate CG map visualization: {e}")
