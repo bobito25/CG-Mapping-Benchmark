@@ -1,13 +1,15 @@
 import jax
 import jax.numpy as jnp
+import numpy as onp
 from chemtrain.trainers import ForceMatching
 from chemtrain.learn import max_likelihood
 from jax_md import space
 from cgbench.core.mapping import _map_single as cg_map_single
 from typing import Dict, Any
+from nan_detector import check_array_jit, check_pairwise_distances, inspect_gradients, inspect_losses
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, debug_nans=False, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
@@ -18,8 +20,10 @@ class CGForceMatching(ForceMatching):
         self.temperature = 1.0
         self.use_direct_force_mapping = use_direct_force_mapping
         self.learned_species_embedding = learned_species_embedding
+        self.debug_nans = debug_nans
         self.epoch_cg_gradients = []
         self.saved_cg_gradients = {}
+        self._step_counter = 0
         
         # Wrap update_fn of nbrs_init to stop gradients on position
         original_update_fn = nbrs_init.update_fn
@@ -77,6 +81,13 @@ class CGForceMatching(ForceMatching):
                     return_assignments=True
                 )
                 cg_species = jnp.tile(self.cg_species, (batch['R'].shape[0], 1))
+                species_features = None
+
+            if self.debug_nans:
+                c_map = check_array_jit("c_map", c_map)
+                assignments = check_array_jit("assignments", assignments)
+                if species_features is not None:
+                    species_features = check_array_jit("species_features", species_features)
 
             # Convert R to Cartesian space
             box_tensor = batch["box"][0]
@@ -105,12 +116,17 @@ class CGForceMatching(ForceMatching):
                     (R_cart, batch['F']), shift_fn_cart, displacement_fn_cart, c_map, c_map
                 )
             
+            # Pass actual CG species and masks for the target CG layer
+            cg_mask = jnp.sum(assignments, axis=-2) > 0.0
+
+            if self.debug_nans:
+                R_cg_cart = check_array_jit("R_cg_cart", R_cg_cart)
+                F_cg = check_array_jit("F_cg", F_cg)
+                check_pairwise_distances("R_cg_cart", R_cg_cart, mask=cg_mask)
+
             # Convert R_cg_cart back to fractional coordinates
             inv_box_tensor = jnp.linalg.inv(box_tensor)
             R_cg = jax.vmap(lambda r: jnp.dot(inv_box_tensor, r.T).T)(R_cg_cart)
-
-            # Pass actual CG species and masks for the target CG layer
-            cg_mask = jnp.sum(assignments, axis=-2) > 0.0
 
             # Exclude temperature from cg_batch to prevent vmap ranking errors in base_model
             clean_batch = {k: v for k, v in batch.items() if k != 'temperature'}
@@ -125,6 +141,53 @@ class CGForceMatching(ForceMatching):
 
             # Run chemtrain's standard model on the CG proxy batch
             predictions = base_model(params['mace'], cg_batch)
+
+            if self.debug_nans:
+                if 'F' in predictions:
+                    predictions['F'] = check_array_jit("mace_predictions['F']", predictions['F'])
+                    is_nan_F = jnp.isnan(predictions['F'])
+                    def _print_nan_bead_info():
+                        nan_bead_mask = jnp.any(is_nan_F, axis=-1) # (32, 10)
+                        active_nans = jnp.sum(nan_bead_mask & cg_mask)
+                        empty_nans = jnp.sum(nan_bead_mask & (~cg_mask))
+                        
+                        # Find first frame with NaN
+                        frame_has_nan = jnp.any(nan_bead_mask, axis=-1)
+                        b_idx = jnp.argmax(frame_has_nan)
+                        
+                        frame_nan_beads = nan_bead_mask[b_idx]
+                        frame_cg_mask = cg_mask[b_idx]
+                        frame_counts = jnp.sum(assignments[b_idx], axis=-2)
+                        frame_pos = R_cg_cart[b_idx]
+                        
+                        nan_bead_indices = jnp.where(frame_nan_beads, jnp.arange(10), -1)
+
+                        jax.debug.print(
+                            "\n" + "="*80 + "\n"
+                            "[NAN FORCE PINPOINT]\n"
+                            "Total NaN beads in batch: {tot} (Active: {act}, Empty: {emp})\n"
+                            "First Corrupted Batch Index: {b}\n"
+                            "Corrupted Bead Indices: {bead_idxs}\n"
+                            "Mask for this frame (cg_mask): {mask}\n"
+                            "Atom counts per bead (sum of assignments): {counts}\n"
+                            "Positions of beads:\n{pos}\n"
+                            + "="*80,
+                            tot=jnp.sum(nan_bead_mask),
+                            act=active_nans,
+                            emp=empty_nans,
+                            b=b_idx,
+                            bead_idxs=nan_bead_indices,
+                            mask=frame_cg_mask,
+                            counts=frame_counts,
+                            pos=frame_pos,
+                        )
+                    jax.lax.cond(jnp.any(is_nan_F), _print_nan_bead_info, lambda: None)
+                if 'energy' in predictions:
+                    predictions['energy'] = check_array_jit("mace_predictions['energy']", predictions['energy'])
+
+            # Cleanly mask predicted forces so unassigned/empty beads cannot inject NaNs into the loss
+            if 'F' in predictions:
+                predictions['F'] = jnp.where(cg_mask[:, :, None], predictions['F'], 0.0)
 
             # Push mapped reference forces into predictions so custom loss can find them
             predictions['Mapped_Target_F'] = F_cg
@@ -195,6 +258,10 @@ class CGForceMatching(ForceMatching):
                 errors['intra_bead_dispersion'] = intra_disp
                 errors['intra_bead_loss'] = intra_loss
 
+            if self.debug_nans:
+                scaled_F_error = check_array_jit("scaled_F_error", scaled_F_error)
+                corrected_loss = check_array_jit("corrected_loss", corrected_loss)
+
             return corrected_loss, errors
 
         # Overwrite the tracked references
@@ -216,9 +283,14 @@ class CGForceMatching(ForceMatching):
         def wrapped_update_fn(params, opt_state, batch, per_target=True):
             outputs = original_train_update_fn(params, opt_state, batch, per_target=per_target)
             
-            # Extract gradients from outputs (index 3 is the gradient structure)
+            # Extract outputs: (new_params, new_opt_state, loss, grad, per_target_loss)
+            loss = outputs[2]
             grad = outputs[3]
-            grad_cg = grad.get('cg_map', None)
+            per_target_loss = outputs[4] if len(outputs) > 4 else None
+
+            # Extract gradients for tracking
+            grad_cg = grad.get('cg_map', None) if isinstance(grad, dict) else None
+            dense_keys = []
             if grad_cg is not None:
                 dense_keys = [k for k in grad_cg.keys() if 'Dense' in k]
                 if dense_keys:
@@ -229,6 +301,32 @@ class CGForceMatching(ForceMatching):
                         'kernel': kernel_grad,
                         'bias': bias_grad
                     })
+
+            # LIGHTWEIGHT CHECK (Always run):
+            # Check if loss is finite
+            loss_val = float(onp.asarray(jax.device_get(loss)))
+            is_loss_corrupted = not onp.isfinite(loss_val)
+
+            # Check if mapping gradients contain NaNs (only inspects ~200 floats in Dense layer)
+            cg_grad_corrupted = False
+            if grad_cg is not None and dense_keys:
+                dense_grad = grad_cg[dense_keys[0]]
+                k_grad = dense_grad.get('kernel', None)
+                if k_grad is not None:
+                    k_arr = onp.asarray(jax.device_get(k_grad))
+                    if not onp.all(onp.isfinite(k_arr)):
+                        cg_grad_corrupted = True
+
+            # Trigger detailed diagnostics if loss or cg_grad is corrupted, or if debug_nans is enabled
+            if is_loss_corrupted or cg_grad_corrupted or self.debug_nans:
+                inspect_losses(loss, per_target_loss, step_idx=self._step_counter)
+                has_nan_or_inf, _ = inspect_gradients(grad, step_idx=self._step_counter)
+                if is_loss_corrupted or cg_grad_corrupted or has_nan_or_inf:
+                    raise FloatingPointError(
+                        f"[FATAL] NaN or infinite value detected at step {self._step_counter}! Halting training immediately."
+                    )
+
+            self._step_counter += 1
             return outputs
         self._update_fn = wrapped_update_fn
 

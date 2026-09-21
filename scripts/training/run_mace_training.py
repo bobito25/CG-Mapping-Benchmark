@@ -154,6 +154,11 @@ parser.add_argument(
     help="Weight for empty bead penalty regularizer",
     default=None,
 )
+parser.add_argument(
+    "--debug-nans",
+    action="store_true",
+    help="Enable deep JIT-level NaN/Inf tracing, forward intermediate probes, and JAX debug_nans checks.",
+)
 args = parser.parse_args()
 
 device_choice = args.device or os.environ.get("GPU_CHOICE")
@@ -161,6 +166,9 @@ if device_choice and "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = device_choice
 
 import jax
+if args.debug_nans:
+    print("[INFO] Deep NaN debugging enabled: intermediate forward probes, pairwise distance checks, and gradient inspector active.")
+
 import numpy as onp
 import optax
 from trainer import CGForceMatching
@@ -595,8 +603,8 @@ def energy_fn_template(energy_params):
     def energy_fn(pos, neighbor, mode=None, **dynamic_kwargs):
         del mode
         dynamic_kwargs.setdefault("species", species_init)
-        dynamic_kwargs.setdefault("box", box)
-        mask = dynamic_kwargs.pop("mask", jnp.ones(pos.shape[0], dtype=jnp.bool_))
+        mask = dynamic_kwargs.get("mask", jnp.ones(pos.shape[0], dtype=jnp.bool_))
+        dynamic_kwargs["mask"] = mask
 
         pots = gnn_energy_fn(vars, pos, neighbor, **dynamic_kwargs)
         if pots.ndim == 2 and pots.shape[-1] == 1:
@@ -737,7 +745,8 @@ if MACE_CONFIG["CG_map"] == "learned":
         empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0),
         intra_bead_distance_weight=TRAIN_CONFIG.get("intra_bead_distance_weight", 0.0),
         use_direct_force_mapping=MACE_CONFIG["use_direct_force_mapping"],
-        learned_species_embedding=MACE_CONFIG["learned_species_embedding"]
+        learned_species_embedding=MACE_CONFIG["learned_species_embedding"],
+        debug_nans=args.debug_nans,
     )
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}
