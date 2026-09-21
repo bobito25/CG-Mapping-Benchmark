@@ -49,6 +49,7 @@ DEFAULT_MACE_CONFIG = {
     "use_direct_force_mapping": True,
     "freeze_cg_after_epoch": None,
     "cg_init": "random",
+    "cg_update_freq": 1,
 }
 
 DEFAULT_NEQUIP_CONFIG = {
@@ -64,6 +65,7 @@ DEFAULT_TRAIN_CONFIG = {
     "decay_rate": 0.90,
     "optimizer": "adam+decay",
     "cg_save_freq": 1,
+    "cg_update_freq": 1,
     "gumbel_temp": 0.0,
     "gumbel_temp_min": 0.1,
     "gumbel_temp_max": 1.0,

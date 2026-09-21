@@ -9,7 +9,7 @@ from typing import Dict, Any
 from nan_detector import check_array_jit, check_pairwise_distances, inspect_gradients, inspect_losses
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, debug_nans=False, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, debug_nans=False, cg_update_freq=1, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
@@ -21,6 +21,7 @@ class CGForceMatching(ForceMatching):
         self.use_direct_force_mapping = use_direct_force_mapping
         self.learned_species_embedding = learned_species_embedding
         self.debug_nans = debug_nans
+        self.cg_update_freq = cg_update_freq
         self.epoch_cg_gradients = []
         self.saved_cg_gradients = {}
         self._step_counter = 0

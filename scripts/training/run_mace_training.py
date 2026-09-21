@@ -155,6 +155,14 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument(
+    "--cg-update-freq",
+    "--cg-update-interval",
+    dest="cg_update_freq",
+    type=int,
+    help="Frequency (in batches/MACE updates) to update learned CG mapping parameters (default: 1, i.e. every batch)",
+    default=None,
+)
+parser.add_argument(
     "--debug-nans",
     action="store_true",
     help="Enable deep JIT-level NaN/Inf tracing, forward intermediate probes, and JAX debug_nans checks.",
@@ -271,6 +279,14 @@ if args.intra_bead_dist_weight is not None:
 if args.empty_bead_penalty_weight is not None:
     TRAIN_CONFIG["empty_bead_penalty_weight"] = args.empty_bead_penalty_weight
 
+cg_update_freq = args.cg_update_freq
+if cg_update_freq is None:
+    cg_update_freq = TRAIN_CONFIG.get("cg_update_freq", 1)
+if cg_update_freq < 1:
+    raise ValueError(f"--cg-update-freq must be an integer >= 1, got {cg_update_freq}")
+TRAIN_CONFIG["cg_update_freq"] = cg_update_freq
+MACE_CONFIG["cg_update_freq"] = cg_update_freq
+
 freeze_after = MACE_CONFIG.get("freeze_cg_after_epoch", None)
 if (MACE_CONFIG["freeze_cg"] or freeze_after is not None) and MACE_CONFIG["CG_map"] != "learned":
     print("[WARNING] --freeze-cg or --freeze-cg-after-epoch was specified, but CG mapping choice is not 'learned'. Freezing has no effect.")
@@ -366,7 +382,10 @@ if MACE_CONFIG["CG_map"] == "learned":
         intra_dist_suffix = f"_intradist={TRAIN_CONFIG['intra_bead_distance_weight']}"
     else:
         intra_dist_suffix = ""
+    cg_update_suffix = f"_cgupdate={cg_update_freq}" if cg_update_freq > 1 else ""
     print("[INFO] Gumbel temperature: ", TRAIN_CONFIG["gumbel_temp"])
+    if cg_update_freq > 1:
+        print(f"[INFO] CG mapping update frequency: every {cg_update_freq} MACE updates")
 else:
     freeze_suffix = ""
     gumbel_temp_suffix = ""
@@ -374,9 +393,10 @@ else:
     species_suffix = ""
     cg_init_suffix = ""
     intra_dist_suffix = ""
+    cg_update_suffix = ""
 
 label_suffix = f"_{args.label}" if args.label is not None else ""
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}{intra_dist_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}{intra_dist_suffix}{cg_update_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
 os.makedirs(output_dir, exist_ok=True)
 
 if MACE_CONFIG["CG_map"] == "learned":
@@ -709,25 +729,58 @@ if args.verbose:
 # -------------------------
 from chemtrain.trainers import ForceMatching
 
-def make_cg_labels(params, learned_species_embedding=False):
+def make_joint_labels(params, freeze_cg=False, learned_species_embedding=False):
     def label_fn(path, leaf):
         path_strs = [str(p.key) if hasattr(p, 'key') else str(p) for p in path]
         if path_strs[0] == 'cg_map':
-            if 'atom_type_embeddings' in path_strs and learned_species_embedding:
-                return 'trainable'
-            return 'frozen'
-        return 'trainable'
+            if freeze_cg:
+                if 'atom_type_embeddings' in path_strs and learned_species_embedding:
+                    return 'cg_map'
+                return 'frozen'
+            return 'cg_map'
+        return 'mace'
     return jax.tree_util.tree_map_with_path(label_fn, params)
 
 if MACE_CONFIG["CG_map"] == "learned":
     cg_save_freq = TRAIN_CONFIG.get("cg_save_freq", 5)
     joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
     
-    if MACE_CONFIG["freeze_cg"]:
-        print("[INFO] Freezing learned CG assignment weights.")
-        labels = make_cg_labels(joint_params, learned_species_embedding=MACE_CONFIG["learned_species_embedding"])
+    if cg_update_freq > 1 or MACE_CONFIG["freeze_cg"]:
+        if MACE_CONFIG["freeze_cg"]:
+            print("[INFO] Freezing learned CG assignment weights.")
+        if cg_update_freq > 1:
+            print(f"[INFO] Setting learned CG mapping update frequency to every {cg_update_freq} MACE updates.")
+            cg_transition_steps = max(1, total_steps // cg_update_freq)
+            cg_scheduler = optax.exponential_decay(
+                init_value=TRAIN_CONFIG["init_lr"],
+                transition_steps=cg_transition_steps,
+                decay_rate=TRAIN_CONFIG["decay_rate"],
+            )
+            optimizer_cg_inner = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.scale_by_adam(),
+                optax.scale_by_schedule(cg_scheduler),
+                optax.scale(-1.0),
+            )
+            optimizer_cg = optax.MultiSteps(
+                optimizer_cg_inner,
+                every_k_schedule=cg_update_freq,
+                use_grad_mean=True
+            ).gradient_transformation()
+        else:
+            optimizer_cg = optimizer_fm
+
+        labels = make_joint_labels(
+            joint_params,
+            freeze_cg=MACE_CONFIG["freeze_cg"],
+            learned_species_embedding=MACE_CONFIG["learned_species_embedding"]
+        )
         optimizer_fm = optax.multi_transform(
-            {'trainable': optimizer_fm, 'frozen': optax.set_to_zero()},
+            {
+                'mace': optimizer_fm,
+                'cg_map': optimizer_cg,
+                'frozen': optax.set_to_zero(),
+            },
             labels
         )
 
@@ -747,6 +800,7 @@ if MACE_CONFIG["CG_map"] == "learned":
         use_direct_force_mapping=MACE_CONFIG["use_direct_force_mapping"],
         learned_species_embedding=MACE_CONFIG["learned_species_embedding"],
         debug_nans=args.debug_nans,
+        cg_update_freq=cg_update_freq,
     )
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}
