@@ -9,7 +9,7 @@ from typing import Dict, Any
 from nan_detector import check_array_jit, check_pairwise_distances, inspect_gradients, inspect_losses
 
 class CGForceMatching(ForceMatching):
-    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, debug_nans=False, cg_update_freq=1, **kwargs):
+    def __init__(self, init_params, optimizer, energy_fn_template, nbrs_init, model_cg_map, cg_species, atom_masses, freeze_cg=False, empty_bead_penalty_weight=0.0, intra_bead_distance_weight=0.0, acc_penalty_weight=0.0, use_direct_force_mapping=True, learned_species_embedding=False, debug_nans=False, cg_update_freq=1, **kwargs):
         self.model_cg_map = model_cg_map
         self.nbrs_init = nbrs_init
         self.cg_species = jnp.asarray(cg_species, dtype=jnp.int32)
@@ -17,6 +17,7 @@ class CGForceMatching(ForceMatching):
         self.freeze_cg = freeze_cg
         self.empty_bead_penalty_weight = empty_bead_penalty_weight
         self.intra_bead_distance_weight = intra_bead_distance_weight
+        self.acc_penalty_weight = acc_penalty_weight
         self.temperature = 1.0
         self.use_direct_force_mapping = use_direct_force_mapping
         self.learned_species_embedding = learned_species_embedding
@@ -24,7 +25,40 @@ class CGForceMatching(ForceMatching):
         self.cg_update_freq = cg_update_freq
         self.epoch_cg_gradients = []
         self.saved_cg_gradients = {}
+        self.saved_cg_logits_history = {}
         self._step_counter = 0
+
+        # Track step-to-step hard CG assignment changes
+        self._last_cg_assignment = None
+        self.epoch_cg_map_changes = 0
+        self.epoch_cg_step_count = 0
+        self.epoch_cg_atom_flips = 0
+        self.total_cg_map_changes = 0
+        self.total_cg_step_count = 0
+        self.total_cg_atom_flips = 0
+        self.cg_map_change_events = []
+        self.saved_cg_map_transitions = {
+            "epoch": [],
+            "epoch_steps": [],
+            "epoch_changes": [],
+            "epoch_change_rate": [],
+            "epoch_atom_flips": [],
+            "cumulative_steps": [],
+            "cumulative_changes": [],
+            "cumulative_change_rate": [],
+            "cumulative_atom_flips": [],
+        }
+
+        cg_init = init_params.get('cg_map', None) if isinstance(init_params, dict) else None
+        if cg_init is not None:
+            dense_keys_init = [k for k in cg_init.keys() if 'Dense' in k]
+            if dense_keys_init:
+                dense_init = cg_init[dense_keys_init[0]]
+                k_i = dense_init.get('kernel', None)
+                b_i = dense_init.get('bias', None)
+                if k_i is not None:
+                    l_i = (k_i + b_i[None, :]) if b_i is not None else k_i
+                    self._last_cg_assignment = onp.asarray(jax.device_get(jnp.argmax(l_i, axis=-1)))
         
         # Wrap update_fn of nbrs_init to stop gradients on position
         original_update_fn = nbrs_init.update_fn
@@ -214,6 +248,22 @@ class CGForceMatching(ForceMatching):
                 batch_dispersions = jax.vmap(frame_disp_fn)(R_cg_cart, R_cart, assignments)
                 predictions['intra_bead_dispersion'] = batch_dispersions
 
+            # Compute acceleration penalty regularization term if weight is positive:
+            # M_I = sum_i p_{iI} m_i
+            # F_I = sum_i p_{iI} F_i
+            # acc_penalty = < 1/N_CG sum_I |F_I|^2 / M_I^2 >
+            if self.acc_penalty_weight > 0.0:
+                # M_I: mass of coarse-grained bead I (sum_i p_{iI} m_i)
+                M_I = jnp.sum(assignments * self.atom_masses[None, :, None], axis=-2)  # (batch_size, num_cg_beads)
+                # F_I: total mapped force on bead I (reuses F_cg when direct force mapping is active)
+                F_I = F_cg if self.use_direct_force_mapping else jnp.einsum("Bni, Bnd -> Bid", assignments, batch['F'])
+                F_I_sq = jnp.sum(F_I ** 2, axis=-1)  # (batch_size, num_cg_beads)
+                safe_M_sq = jnp.maximum(M_I ** 2, 1e-4)
+                accel_sq = F_I_sq / safe_M_sq
+                accel_sq = jnp.where(M_I > 1e-3, accel_sq, 0.0)
+                num_cg = assignments.shape[-1]
+                predictions['acc_penalty'] = jnp.sum(accel_sq, axis=-1) / num_cg  # (batch_size,)
+
             return predictions
 
         # Create a custom loss that looks at the mapped targets instead of the original batch targets
@@ -259,9 +309,19 @@ class CGForceMatching(ForceMatching):
                 errors['intra_bead_dispersion'] = intra_disp
                 errors['intra_bead_loss'] = intra_loss
 
+            # Add acceleration penalty regularization if weight is positive and computed
+            if 'acc_penalty' in predictions and self.acc_penalty_weight > 0.0:
+                acc_val = jnp.mean(predictions['acc_penalty'])
+                acc_loss = self.acc_penalty_weight * acc_val
+                corrected_loss = corrected_loss + acc_loss
+                errors['acc_penalty'] = acc_val
+                errors['acc_penalty_loss'] = acc_loss
+
             if self.debug_nans:
                 scaled_F_error = check_array_jit("scaled_F_error", scaled_F_error)
                 corrected_loss = check_array_jit("corrected_loss", corrected_loss)
+                if 'acc_penalty' in predictions and self.acc_penalty_weight > 0.0:
+                    acc_loss = check_array_jit("acc_penalty_loss", acc_loss)
 
             return corrected_loss, errors
 
@@ -302,6 +362,38 @@ class CGForceMatching(ForceMatching):
                         'kernel': kernel_grad,
                         'bias': bias_grad
                     })
+
+            # Track hard assignment changes vs previous step/batch
+            if not self.freeze_cg:
+                new_params = outputs[0]
+                cg_map_params = new_params.get('cg_map', None) if isinstance(new_params, dict) else None
+                if cg_map_params is not None:
+                    dense_keys_p = [k for k in cg_map_params.keys() if 'Dense' in k]
+                    if dense_keys_p:
+                        dense_p = cg_map_params[dense_keys_p[0]]
+                        k_mat = dense_p.get('kernel', None)
+                        b_vec = dense_p.get('bias', None)
+                        if k_mat is not None:
+                            logits_mat = (k_mat + b_vec[None, :]) if b_vec is not None else k_mat
+                            curr_assign = onp.asarray(jax.device_get(jnp.argmax(logits_mat, axis=-1)))
+                            if self._last_cg_assignment is not None:
+                                flips = int(onp.sum(curr_assign != self._last_cg_assignment))
+                                if flips > 0:
+                                    self.epoch_cg_map_changes += 1
+                                    self.total_cg_map_changes += 1
+                                    self.epoch_cg_atom_flips += flips
+                                    self.total_cg_atom_flips += flips
+                                    self.cg_map_change_events.append({
+                                        'step': int(self._step_counter),
+                                        'epoch': int(self._epoch),
+                                        'changed_atoms': flips
+                                    })
+                            self.epoch_cg_step_count += 1
+                            self.total_cg_step_count += 1
+                            self._last_cg_assignment = curr_assign
+            else:
+                self.epoch_cg_step_count += 1
+                self.total_cg_step_count += 1
 
             # LIGHTWEIGHT CHECK (Always run):
             # Check if loss is finite

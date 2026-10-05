@@ -327,6 +327,64 @@ def plot_temperature_schedule(
     plt.close(fig)
 
 
+def plot_lr_schedule(
+    lr_schedule: str,
+    epochs: int,
+    out_dir: str,
+    init_lr: float = 0.001,
+    decay_rate: float = 0.90,
+    end_lr: float = 1e-5,
+) -> None:
+    """
+    Plot the learning rate schedule over epochs and save to out_dir.
+
+    Parameters
+    ----------
+    lr_schedule : str
+        Schedule type: 'constant', 'linear', or 'exponential'
+    epochs : int
+        Number of epochs to train
+    out_dir : str
+        Output directory to save the figure
+    init_lr : float, optional
+        Initial learning rate (default: 0.001)
+    decay_rate : float, optional
+        Decay rate for exponential schedule (default: 0.90)
+    end_lr : float, optional
+        End learning rate for linear schedule (default: 1e-5)
+    """
+    epochs_arr = np.arange(epochs)
+    schedule_str = str(lr_schedule).lower()
+
+    if schedule_str == "constant":
+        lrs = [init_lr] * epochs
+    elif schedule_str == "linear":
+        if epochs <= 1:
+            lrs = [init_lr] * epochs
+        else:
+            lrs = [init_lr + (end_lr - init_lr) * (e / (epochs - 1)) for e in epochs_arr]
+    elif schedule_str == "exponential":
+        if epochs <= 1:
+            lrs = [init_lr] * epochs
+        else:
+            lrs = [init_lr * (decay_rate ** (e / (epochs - 1))) for e in epochs_arr]
+    else:
+        raise ValueError(f"Unknown learning rate schedule: {lr_schedule}. Expected 'constant', 'linear', or 'exponential'.")
+
+    fig, ax = plt.subplots(1, 1, figsize=(5.5, 4), layout="constrained")
+    ax.plot(epochs_arr, lrs, marker="o", markersize=4, color="#1f77b4", linewidth=2.0)
+    ax.set_title(f"Learning Rate Schedule ({schedule_str.capitalize()})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning Rate")
+    ax.grid(True, linestyle="--", alpha=0.6)
+    ax.ticklabel_format(axis="y", style="scientific", scilimits=(0, 0))
+
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(f"{out_dir}/learning_rate_schedule.png", bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
 ATOMIC_NUMBER_TO_SYMBOL = {
     1: "H",
     2: "He",

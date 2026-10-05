@@ -155,11 +155,60 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument(
+    "--acc-penalty-weight",
+    "--acc-penalty",
+    "--acceleration-penalty-weight",
+    dest="acc_penalty_weight",
+    type=float,
+    help="Weight for acceleration penalty regularizer (penalizes fast degrees of freedom: sum_I |F_I|^2 / M_I^2)",
+    default=None,
+)
+parser.add_argument(
     "--cg-update-freq",
     "--cg-update-interval",
     dest="cg_update_freq",
     type=int,
     help="Frequency (in batches/MACE updates) to update learned CG mapping parameters (default: 1, i.e. every batch)",
+    default=None,
+)
+parser.add_argument(
+    "--lr-schedule",
+    type=str,
+    choices=["constant", "linear", "exponential"],
+    help="Learning rate schedule: 'constant', 'linear', or 'exponential'",
+    default=None,
+)
+parser.add_argument(
+    "--init-lr",
+    "--lr",
+    dest="init_lr",
+    type=float,
+    help="Initial learning rate for training (used for constant, linear, and exponential schedules)",
+    default=None,
+)
+parser.add_argument(
+    "--decay-rate",
+    "--lr-decay-rate",
+    dest="decay_rate",
+    type=float,
+    help="Decay rate multiplier for exponential learning rate schedule",
+    default=None,
+)
+parser.add_argument(
+    "--end-lr",
+    "--lr-end",
+    dest="end_lr",
+    type=float,
+    help="End/final learning rate for linear learning rate schedule",
+    default=None,
+)
+parser.add_argument(
+    "--cg-weight-decay",
+    "--weight-decay",
+    "--cg-wd",
+    dest="cg_weight_decay",
+    type=float,
+    help="Weight decay (L2 regularization) applied specifically to learned CG assignment parameters (default: 0.0, off)",
     default=None,
 )
 parser.add_argument(
@@ -279,6 +328,26 @@ if args.intra_bead_dist_weight is not None:
 if args.empty_bead_penalty_weight is not None:
     TRAIN_CONFIG["empty_bead_penalty_weight"] = args.empty_bead_penalty_weight
 
+if args.acc_penalty_weight is not None:
+    TRAIN_CONFIG["acc_penalty_weight"] = args.acc_penalty_weight
+
+if args.lr_schedule is not None:
+    TRAIN_CONFIG["lr_schedule"] = args.lr_schedule.lower()
+if args.init_lr is not None:
+    TRAIN_CONFIG["init_lr"] = args.init_lr
+if args.decay_rate is not None:
+    TRAIN_CONFIG["decay_rate"] = args.decay_rate
+if args.end_lr is not None:
+    TRAIN_CONFIG["end_lr"] = args.end_lr
+if args.cg_weight_decay is not None:
+    TRAIN_CONFIG["cg_weight_decay"] = args.cg_weight_decay
+
+if TRAIN_CONFIG.get("cg_weight_decay", 0.0) > 0.0 and MACE_CONFIG["CG_map"] != "learned":
+    print("[WARNING] --cg-weight-decay was specified, but CG mapping choice is not 'learned'. Weight decay has no effect.")
+
+if TRAIN_CONFIG.get("acc_penalty_weight", 0.0) > 0.0 and MACE_CONFIG["CG_map"] != "learned":
+    print("[WARNING] --acc-penalty-weight was specified, but CG mapping choice is not 'learned'. Acceleration penalty regularization has no effect.")
+
 cg_update_freq = args.cg_update_freq
 if cg_update_freq is None:
     cg_update_freq = TRAIN_CONFIG.get("cg_update_freq", 1)
@@ -382,6 +451,16 @@ if MACE_CONFIG["CG_map"] == "learned":
         intra_dist_suffix = f"_intradist={TRAIN_CONFIG['intra_bead_distance_weight']}"
     else:
         intra_dist_suffix = ""
+    if TRAIN_CONFIG.get("acc_penalty_weight", 0.0) > 0.0:
+        acc_penalty_suffix = f"_accpen={TRAIN_CONFIG['acc_penalty_weight']}"
+    else:
+        acc_penalty_suffix = ""
+    cg_weight_decay = TRAIN_CONFIG.get("cg_weight_decay", 0.0)
+    if cg_weight_decay > 0.0:
+        cg_wd_suffix = f"_cgwd={cg_weight_decay}"
+        print(f"[INFO] CG mapping weight decay: {cg_weight_decay}")
+    else:
+        cg_wd_suffix = ""
     cg_update_suffix = f"_cgupdate={cg_update_freq}" if cg_update_freq > 1 else ""
     print("[INFO] Gumbel temperature: ", TRAIN_CONFIG["gumbel_temp"])
     if cg_update_freq > 1:
@@ -393,11 +472,50 @@ else:
     species_suffix = ""
     cg_init_suffix = ""
     intra_dist_suffix = ""
+    acc_penalty_suffix = ""
+    cg_wd_suffix = ""
     cg_update_suffix = ""
 
+# Determine LR schedule suffix (only if different from default exponential config: lr_schedule="exponential", init_lr=0.001, decay_rate=0.90)
+lr_schedule = TRAIN_CONFIG.get("lr_schedule", "exponential")
+init_lr = TRAIN_CONFIG.get("init_lr", 0.001)
+decay_rate = TRAIN_CONFIG.get("decay_rate", 0.90)
+end_lr = TRAIN_CONFIG.get("end_lr", 1e-5)
+
+is_default_lr_config = (
+    lr_schedule == "exponential"
+    and abs(init_lr - 0.001) < 1e-7
+    and abs(decay_rate - 0.90) < 1e-7
+)
+
+if is_default_lr_config:
+    lr_suffix = ""
+elif lr_schedule == "constant":
+    lr_suffix = f"_lrsched=constant_initlr={init_lr}"
+elif lr_schedule == "linear":
+    lr_suffix = f"_lrsched=linear_initlr={init_lr}_endlr={end_lr}"
+elif lr_schedule == "exponential":
+    lr_suffix = f"_lrsched=exponential_initlr={init_lr}_decayrate={decay_rate}"
+else:
+    lr_suffix = f"_lrsched={lr_schedule}_initlr={init_lr}"
+
 label_suffix = f"_{args.label}" if args.label is not None else ""
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}{intra_dist_suffix}{cg_update_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}{intra_dist_suffix}{acc_penalty_suffix}{cg_wd_suffix}{cg_update_suffix}{lr_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
 os.makedirs(output_dir, exist_ok=True)
+
+try:
+    from cgbench.plotting.training import plot_lr_schedule
+    plot_lr_schedule(
+        lr_schedule=lr_schedule,
+        epochs=TRAIN_CONFIG["num_epochs"],
+        out_dir=output_dir,
+        init_lr=init_lr,
+        decay_rate=decay_rate,
+        end_lr=end_lr,
+    )
+    print(f"[INFO] Saved learning rate schedule plot to {output_dir}/learning_rate_schedule.png")
+except Exception as e:
+    print(f"[WARNING] Could not plot learning rate schedule: {e}")
 
 if MACE_CONFIG["CG_map"] == "learned":
     try:
@@ -706,10 +824,33 @@ epochs = TRAIN_CONFIG["num_epochs"]
 total_steps = (epochs * num_samples) // batch_size
 transition_steps = total_steps
 
-scheduler = optax.exponential_decay(
+def get_lr_scheduler(schedule_type, init_value, steps, decay_rate=0.90, end_lr=1e-5):
+    schedule_str = str(schedule_type).lower()
+    if schedule_str == "constant":
+        return optax.constant_schedule(init_value)
+    elif schedule_str == "linear":
+        return optax.linear_schedule(
+            init_value=init_value,
+            end_value=end_lr,
+            transition_steps=steps,
+        )
+    elif schedule_str == "exponential":
+        return optax.exponential_decay(
+            init_value=init_value,
+            transition_steps=steps,
+            decay_rate=decay_rate,
+        )
+    else:
+        raise ValueError(
+            f"Unknown learning rate schedule: '{schedule_type}'. Choose from 'constant', 'linear', or 'exponential'."
+        )
+
+scheduler = get_lr_scheduler(
+    schedule_type=TRAIN_CONFIG.get("lr_schedule", "exponential"),
     init_value=TRAIN_CONFIG["init_lr"],
-    transition_steps=transition_steps,
-    decay_rate=TRAIN_CONFIG["decay_rate"],
+    steps=transition_steps,
+    decay_rate=TRAIN_CONFIG.get("decay_rate", 0.90),
+    end_lr=TRAIN_CONFIG.get("end_lr", 1e-5),
 )
 
 optimizer_fm = optax.chain(
@@ -745,30 +886,39 @@ if MACE_CONFIG["CG_map"] == "learned":
     cg_save_freq = TRAIN_CONFIG.get("cg_save_freq", 5)
     joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
     
-    if cg_update_freq > 1 or MACE_CONFIG["freeze_cg"]:
+    cg_weight_decay = TRAIN_CONFIG.get("cg_weight_decay", 0.0)
+    if cg_update_freq > 1 or MACE_CONFIG["freeze_cg"] or cg_weight_decay > 0.0:
         if MACE_CONFIG["freeze_cg"]:
             print("[INFO] Freezing learned CG assignment weights.")
+        cg_transition_steps = max(1, total_steps // cg_update_freq)
+        cg_scheduler = get_lr_scheduler(
+            schedule_type=TRAIN_CONFIG.get("lr_schedule", "exponential"),
+            init_value=TRAIN_CONFIG["init_lr"],
+            steps=cg_transition_steps,
+            decay_rate=TRAIN_CONFIG.get("decay_rate", 0.90),
+            end_lr=TRAIN_CONFIG.get("end_lr", 1e-5),
+        )
+        cg_chain = [
+            optax.clip_by_global_norm(1.0),
+            optax.scale_by_adam(),
+        ]
+        if cg_weight_decay > 0.0:
+            cg_chain.append(optax.add_decayed_weights(cg_weight_decay))
+        cg_chain.extend([
+            optax.scale_by_schedule(cg_scheduler),
+            optax.scale(-1.0),
+        ])
+        optimizer_cg_inner = optax.chain(*cg_chain)
+
         if cg_update_freq > 1:
             print(f"[INFO] Setting learned CG mapping update frequency to every {cg_update_freq} MACE updates.")
-            cg_transition_steps = max(1, total_steps // cg_update_freq)
-            cg_scheduler = optax.exponential_decay(
-                init_value=TRAIN_CONFIG["init_lr"],
-                transition_steps=cg_transition_steps,
-                decay_rate=TRAIN_CONFIG["decay_rate"],
-            )
-            optimizer_cg_inner = optax.chain(
-                optax.clip_by_global_norm(1.0),
-                optax.scale_by_adam(),
-                optax.scale_by_schedule(cg_scheduler),
-                optax.scale(-1.0),
-            )
             optimizer_cg = optax.MultiSteps(
                 optimizer_cg_inner,
                 every_k_schedule=cg_update_freq,
                 use_grad_mean=True
             ).gradient_transformation()
         else:
-            optimizer_cg = optimizer_fm
+            optimizer_cg = optimizer_cg_inner
 
         labels = make_joint_labels(
             joint_params,
@@ -797,6 +947,7 @@ if MACE_CONFIG["CG_map"] == "learned":
         freeze_cg=MACE_CONFIG["freeze_cg"],
         empty_bead_penalty_weight=TRAIN_CONFIG.get("empty_bead_penalty_weight", 0.0),
         intra_bead_distance_weight=TRAIN_CONFIG.get("intra_bead_distance_weight", 0.0),
+        acc_penalty_weight=TRAIN_CONFIG.get("acc_penalty_weight", 0.0),
         use_direct_force_mapping=MACE_CONFIG["use_direct_force_mapping"],
         learned_species_embedding=MACE_CONFIG["learned_species_embedding"],
         debug_nans=args.debug_nans,
@@ -805,6 +956,7 @@ if MACE_CONFIG["CG_map"] == "learned":
     trainer_fm.cg_save_freq = cg_save_freq
     trainer_fm.saved_cg_maps = {}
     trainer_fm.saved_cg_gradients = {}
+    trainer_fm.saved_cg_logits_history = {}
 
     def check_freeze_cg_after_epoch(trainer, *args, **kwargs):
         epoch = trainer._epoch
@@ -862,13 +1014,87 @@ if MACE_CONFIG["CG_map"] == "learned":
                         logits = kernel + bias[None, :]
                     else:
                         logits = kernel
+
+                    logits_np = onp.asarray(jax.device_get(logits))
+                    l_min, l_max = float(onp.min(logits_np)), float(onp.max(logits_np))
+                    l_mean = float(onp.mean(logits_np))
+                    l_norm = float(onp.linalg.norm(logits_np))
+                    max_abs_l = float(onp.max(onp.abs(logits_np)))
+
+                    sorted_logits = onp.sort(logits_np, axis=-1)
+                    margins = (sorted_logits[:, -1] - sorted_logits[:, -2]) if sorted_logits.shape[-1] > 1 else onp.zeros(sorted_logits.shape[0])
+                    avg_margin = float(onp.mean(margins))
+                    max_margin = float(onp.max(margins))
+
+                    if not hasattr(trainer, "saved_cg_logits_history") or not isinstance(trainer.saved_cg_logits_history, dict) or "epoch" not in trainer.saved_cg_logits_history:
+                        trainer.saved_cg_logits_history = {
+                            "epoch": [],
+                            "norm": [],
+                            "max_abs": [],
+                            "min": [],
+                            "max": [],
+                            "mean": [],
+                            "avg_margin": [],
+                            "max_margin": [],
+                            "initial_logits": logits_np.tolist(),
+                        }
+                    trainer.saved_cg_logits_history["epoch"].append(int(epoch))
+                    trainer.saved_cg_logits_history["norm"].append(l_norm)
+                    trainer.saved_cg_logits_history["max_abs"].append(max_abs_l)
+                    trainer.saved_cg_logits_history["min"].append(l_min)
+                    trainer.saved_cg_logits_history["max"].append(l_max)
+                    trainer.saved_cg_logits_history["mean"].append(l_mean)
+                    trainer.saved_cg_logits_history["avg_margin"].append(avg_margin)
+                    trainer.saved_cg_logits_history["max_margin"].append(max_margin)
+                    trainer.saved_cg_logits_history["final_logits"] = logits_np.tolist()
                     
                     assignments = jnp.argmax(logits, axis=-1)
                     print(f"\n--- Learned CG Mapping at Epoch {epoch} ---")
                     
+                    epoch_steps = getattr(trainer, "epoch_cg_step_count", 0)
+                    epoch_changes = getattr(trainer, "epoch_cg_map_changes", 0)
+                    epoch_flips = getattr(trainer, "epoch_cg_atom_flips", 0)
+                    total_steps = getattr(trainer, "total_cg_step_count", 0)
+                    total_changes = getattr(trainer, "total_cg_map_changes", 0)
+                    total_flips = getattr(trainer, "total_cg_atom_flips", 0)
+
+                    epoch_change_rate = (epoch_changes / epoch_steps) if epoch_steps > 0 else 0.0
+                    total_change_rate = (total_changes / total_steps) if total_steps > 0 else 0.0
+
+                    if not hasattr(trainer, "saved_cg_map_transitions") or not isinstance(trainer.saved_cg_map_transitions, dict) or "epoch" not in trainer.saved_cg_map_transitions:
+                        trainer.saved_cg_map_transitions = {
+                            "epoch": [],
+                            "epoch_steps": [],
+                            "epoch_changes": [],
+                            "epoch_change_rate": [],
+                            "epoch_atom_flips": [],
+                            "cumulative_steps": [],
+                            "cumulative_changes": [],
+                            "cumulative_change_rate": [],
+                            "cumulative_atom_flips": [],
+                        }
+
+                    trainer.saved_cg_map_transitions["epoch"].append(int(epoch))
+                    trainer.saved_cg_map_transitions["epoch_steps"].append(int(epoch_steps))
+                    trainer.saved_cg_map_transitions["epoch_changes"].append(int(epoch_changes))
+                    trainer.saved_cg_map_transitions["epoch_change_rate"].append(float(epoch_change_rate))
+                    trainer.saved_cg_map_transitions["epoch_atom_flips"].append(int(epoch_flips))
+                    trainer.saved_cg_map_transitions["cumulative_steps"].append(int(total_steps))
+                    trainer.saved_cg_map_transitions["cumulative_changes"].append(int(total_changes))
+                    trainer.saved_cg_map_transitions["cumulative_change_rate"].append(float(total_change_rate))
+                    trainer.saved_cg_map_transitions["cumulative_atom_flips"].append(int(total_flips))
+
+                    # Reset epoch counters for next epoch
+                    trainer.epoch_cg_step_count = 0
+                    trainer.epoch_cg_map_changes = 0
+                    trainer.epoch_cg_atom_flips = 0
+
                     # Print kernel stats
                     k_min, k_max, k_mean = jnp.min(kernel), jnp.max(kernel), jnp.mean(kernel)
                     print(f"[DEBUG] Mapping weights stats - Min: {k_min:.4f}, Max: {k_max:.4f}, Mean: {k_mean:.4f}")
+                    print(f"[DEBUG] Pre-softmax logits stats - Min: {l_min:.4f}, Max: {l_max:.4f}, Mean: {l_mean:.4f}, Max |logit|: {max_abs_l:.4f}, Avg Margin: {avg_margin:.4f}")
+                    flips_str = f" ({epoch_flips} atom flips, avg {epoch_flips / max(1, epoch_changes):.1f} flips/change)" if epoch_changes > 0 else ""
+                    print(f"[DEBUG] Hard CG map changes vs prev step: {epoch_changes}/{epoch_steps} ({epoch_change_rate * 100:.2f}%) this epoch | Total: {total_changes}/{total_steps} ({total_change_rate * 100:.2f}%){flips_str}")
                     
                     assignments_list = [int(x) for x in jax.device_get(assignments)]
                     print(f"Atom assignments to CG beads: {assignments_list}")
@@ -1027,6 +1253,36 @@ if MACE_CONFIG["CG_map"] == "learned":
             subprocess.run([sys.executable, viz_script, cg_grads_path], check=True)
         except Exception as e:
             print(f"[WARNING] Could not automatically generate gradient visualization: {e}")
+
+    if hasattr(trainer_fm, "saved_cg_logits_history") and trainer_fm.saved_cg_logits_history and trainer_fm.saved_cg_logits_history.get("epoch"):
+        cg_logits_path = f"{output_dir}/cg_logits.json"
+        with open(cg_logits_path, "w") as f:
+            json.dump(trainer_fm.saved_cg_logits_history, f, indent=4)
+        print(f"[INFO] Saved CG pre-softmax logits history to {cg_logits_path}")
+
+        try:
+            import subprocess
+            viz_script = os.path.join(os.path.dirname(__file__), "visualize_cg_logits.py")
+            subprocess.run([sys.executable, viz_script, cg_logits_path], check=True)
+        except Exception as e:
+            print(f"[WARNING] Could not automatically generate logits visualization: {e}")
+
+    if hasattr(trainer_fm, "saved_cg_map_transitions") and trainer_fm.saved_cg_map_transitions and trainer_fm.saved_cg_map_transitions.get("epoch"):
+        cg_transitions_path = f"{output_dir}/cg_map_changes.json"
+        data_to_save = {
+            "transitions": trainer_fm.saved_cg_map_transitions,
+            "change_events": getattr(trainer_fm, "cg_map_change_events", []),
+        }
+        with open(cg_transitions_path, "w") as f:
+            json.dump(data_to_save, f, indent=4)
+        print(f"[INFO] Saved CG map transitions history to {cg_transitions_path}")
+
+        try:
+            import subprocess
+            viz_script = os.path.join(os.path.dirname(__file__), "visualize_cg_map_changes.py")
+            subprocess.run([sys.executable, viz_script, cg_transitions_path], check=True)
+        except Exception as e:
+            print(f"[WARNING] Could not automatically generate CG map changes visualization: {e}")
 else:
     # Static or Custom CG map
     static_map_list = list(initial_mapping) if initial_mapping is not None else []

@@ -60,9 +60,11 @@ DEFAULT_NEQUIP_CONFIG = {
 
 DEFAULT_TRAIN_CONFIG = {
     "batch_size": 32,
+    "lr_schedule": "exponential",
     "init_lr": 0.001,
     "num_epochs": 25,
     "decay_rate": 0.90,
+    "end_lr": 1e-5,
     "optimizer": "adam+decay",
     "cg_save_freq": 1,
     "cg_update_freq": 1,
@@ -74,6 +76,7 @@ DEFAULT_TRAIN_CONFIG = {
     "gumbel_temp_3phase_timings": [0.10, 0.90],
     "empty_bead_penalty_weight": 1000000.0,
     "intra_bead_distance_weight": 0.0,
+    "acc_penalty_weight": 0.0,
     "freeze_cg_after_epoch": None,
 }
 
