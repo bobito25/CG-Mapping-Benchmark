@@ -69,6 +69,10 @@ def main():
     except ValueError:
         sorted_epochs = list(saved_cg_maps.keys())
 
+    if len(sorted_epochs) > 10:
+        step = max(1, len(sorted_epochs) // 10)
+        sorted_epochs = sorted_epochs[::step][:10]
+
     mappings = [saved_cg_maps[ep] for ep in sorted_epochs]
 
     # Infer mol_name if not specified

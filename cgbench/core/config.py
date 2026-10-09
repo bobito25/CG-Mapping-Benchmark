@@ -6,7 +6,7 @@ Dataset_paths = {
     'pro2': '/ds/project/franz/Datasets/l-pro2_ttot=500ns_dt=0.5fs_nstxout=2000.npz',
     'thr2': '/ds/project/franz/Datasets/l-thr2_ttot=500ns_dt=0.5fs_nstxout=2000.npz',
     'gly2': '/ds/project/franz/Datasets/l-gly2_ttot=500ns_dt=0.5fs_nstxout=2000.npz',
-    'ala15': '/ds/project/franz/Datasets/l-ala15_ttot=500ns_dt=0.5fs.npz',
+    'ala15': 'data/l-ala15_ttot=500ns_dt=0.5fs.npz',
 }
 def _get_available_datasets():
     return list(Dataset_paths.keys())
@@ -50,6 +50,7 @@ DEFAULT_MACE_CONFIG = {
     "freeze_cg_after_epoch": None,
     "cg_init": "random",
     "cg_update_freq": 1,
+    "num_cg_beads": 10,
 }
 
 DEFAULT_NEQUIP_CONFIG = {

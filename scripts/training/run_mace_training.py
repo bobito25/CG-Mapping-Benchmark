@@ -27,6 +27,15 @@ parser.add_argument(
     help="Custom fixed CG mapping array as string, e.g., '[8, 8, 2, 4, 7, 0, ...]'",
     default=None,
 )
+parser.add_argument(
+    "--num-cg-beads",
+    "--cg-beads",
+    "--num-beads",
+    dest="num_cg_beads",
+    type=int,
+    help="Number of CG beads for learned CG mapping (default: 10)",
+    default=10,
+)
 parser.add_argument("--mol", type=str, help="Molecule to use", required=True)
 parser.add_argument("--prior", action="store_true", help="Use bond priors")
 parser.add_argument(
@@ -172,6 +181,12 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument(
+    "--cg-save-freq",
+    type=int,
+    help="Frequency (in epochs) to save and output learned CG mapping (overrides auto 10-mapping frequency)",
+    default=None,
+)
+parser.add_argument(
     "--lr-schedule",
     type=str,
     choices=["constant", "linear", "exponential"],
@@ -291,6 +306,11 @@ if MACE_CONFIG["unique_cg_species"] and MACE_CONFIG["learned_species_embedding"]
 
 if args.species_embedding_dim is not None:
     MACE_CONFIG["species_embedding_dim"] = args.species_embedding_dim
+
+if args.num_cg_beads is not None:
+    if args.num_cg_beads <= 0:
+        raise ValueError(f"--num-cg-beads must be a positive integer, got {args.num_cg_beads}")
+    MACE_CONFIG["num_cg_beads"] = args.num_cg_beads
 
 MACE_CONFIG["normalize_atom_embedding"] = args.normalize_atom_embedding or MACE_CONFIG.get("normalize_atom_embedding", False)
 
@@ -443,6 +463,10 @@ if MACE_CONFIG["CG_map"] == "learned":
         species_suffix = f"_learnedspecies=True{norm_suffix}"
     else:
         species_suffix = ""
+    if MACE_CONFIG.get("num_cg_beads") is not None and MACE_CONFIG.get("num_cg_beads") != 10:
+        beads_suffix = f"_beads={MACE_CONFIG['num_cg_beads']}"
+    else:
+        beads_suffix = ""
     if MACE_CONFIG.get("cg_init") != "random":
         cg_init_suffix = f"_cginit={MACE_CONFIG.get('cg_init')}"
     else:
@@ -500,7 +524,7 @@ else:
     lr_suffix = f"_lrsched={lr_schedule}_initlr={init_lr}"
 
 label_suffix = f"_{args.label}" if args.label is not None else ""
-output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{cg_init_suffix}{intra_dist_suffix}{acc_penalty_suffix}{cg_wd_suffix}{cg_update_suffix}{lr_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
+output_dir = f"outputs/MLP_train/{MACE_CONFIG['mol'].capitalize()}_map={MACE_CONFIG['CG_map']}{freeze_suffix}{gumbel_temp_suffix}{direct_force_map_suffix}{species_suffix}{beads_suffix}{cg_init_suffix}{intra_dist_suffix}{acc_penalty_suffix}{cg_wd_suffix}{cg_update_suffix}{lr_suffix}_tr={MACE_CONFIG['train_ratio']}_rcut={MACE_CONFIG['r_cutoff']}_epochs={TRAIN_CONFIG['num_epochs']}_int={MACE_CONFIG['num_interactions']}{label_suffix}"
 os.makedirs(output_dir, exist_ok=True)
 
 try:
@@ -541,16 +565,19 @@ if MACE_CONFIG["CG_map"] == "learned":
 box = data.box
 displacement_fn, _ = space.periodic_general(box=box, fractional_coordinates=True)
 
-# Lookup target map and num_cg_beads
-num_cg_beads = 10
+# Determine CG bead count, initial mapping, and species
+num_cg_beads = None
 initial_mapping = None
-cg_species = onp.zeros(num_cg_beads, dtype=onp.int32)
+cg_species = None
+ref_map_name = None
+ref_species = None
 
 if MACE_CONFIG["type"] == "CG":
-    target_map_name = MACE_CONFIG["CG_map"]
-    if target_map_name == "learned":
-        target_map_name = "custom" if custom_cg_array is not None else "hmerged"  # Reference map to derive bead count and initial species for learned CG mapping
+    is_learned = (MACE_CONFIG["CG_map"] == "learned")
+    cli_specified_beads = any(arg.startswith(("--num-cg-beads", "--cg-beads", "--num-beads")) for arg in sys.argv)
+    explicit_num_beads = args.num_cg_beads if cli_specified_beads else None
 
+    # Resolve mapping helper object if available for this molecule
     mol_name_map = {
         "ala2": "Ala2_Map",
         "ala15": "Ala15_Map",
@@ -559,7 +586,7 @@ if MACE_CONFIG["type"] == "CG":
         "thr2": "Thr2_Map",
         "gly2": "Gly2_Map",
     }
-
+    map_inst = None
     if args.mol in mol_name_map:
         class_name = mol_name_map[args.mol]
         map_class = getattr(mapping, class_name, None)
@@ -568,50 +595,144 @@ if MACE_CONFIG["type"] == "CG":
                 map_inst = getattr(data, "map_obj", map_class())
                 if custom_cg_array is not None and hasattr(map_inst, "_maps"):
                     register_custom_map(map_inst, custom_cg_array)
-
-                # If target_map_name is not in the maps, look for a 10-bead map
-                if target_map_name not in map_inst.get_available_maps():
-                    for map_name in map_inst.get_available_maps():
-                        indices, cg_species_tmp, _, _ = map_inst.get_map(map_name)
-                        if len(cg_species_tmp) == 10:
-                            target_map_name = map_name
-                            break
-                
-                if target_map_name in map_inst.get_available_maps():
-                    indices, cg_species, _, _ = map_inst.get_map(target_map_name)
-                    num_cg_beads = len(cg_species)
-                    if MACE_CONFIG.get("unique_cg_species", False):
-                        cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
-                    indices_clean = [idx if idx >= 0 else 0 for idx in indices]
-                    initial_mapping = tuple(indices_clean)
-                    if MACE_CONFIG["CG_map"] == "learned":
-                        if MACE_CONFIG.get("cg_init") == "random":
-                            print(f"[INFO] Initializing learned CG mapping using RANDOM weights (bead count & species derived from '{target_map_name}' map)")
-                        else:
-                            print(f"[INFO] Initializing learned CG mapping using heuristic '{target_map_name}' map: {initial_mapping}")
-                    else:
-                        print(f"[INFO] Using static '{target_map_name}' map: {initial_mapping}")
-                    print(f"[INFO] Number of CG beads: {num_cg_beads}")
-                    print(f"[INFO] Using CG species: {cg_species}")
-                    MACE_CONFIG["cg_species"] = cg_species.tolist()
-                else:
-                    print(f"[WARNING] No map found. Using default 10 beads. CG species will default to all zeros.")
-                    if MACE_CONFIG.get("unique_cg_species", False):
-                        cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
-                    MACE_CONFIG["cg_species"] = cg_species.tolist()
             except Exception as e:
-                print(f"[WARNING] Error reading heuristic map for initialization: {e}")
+                print(f"[WARNING] Could not initialize mapping object: {e}")
+
+    available_maps = map_inst.get_available_maps() if map_inst is not None else []
+
+    if not is_learned:
+        # Static CG mode: mapping and bead count come directly from the chosen static map
+        target_map_name = MACE_CONFIG["CG_map"]
+        if map_inst is not None and target_map_name in available_maps:
+            indices, cg_species_raw, _, _ = map_inst.get_map(target_map_name)
+            num_cg_beads = len(cg_species_raw)
+            if cli_specified_beads and args.num_cg_beads != num_cg_beads:
+                raise ValueError(
+                    f"Specified --num-cg-beads={args.num_cg_beads} does not match static map '{target_map_name}' ({num_cg_beads} beads)."
+                )
+            indices_clean = [idx if idx >= 0 else 0 for idx in indices]
+            initial_mapping = tuple(indices_clean)
+            if MACE_CONFIG.get("unique_cg_species", False):
+                cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
+            else:
+                cg_species = onp.array(cg_species_raw, dtype=onp.int32)
+            ref_map_name = target_map_name
+            ref_species = cg_species_raw
+        else:
+            # Fallback to dataset species if map class does not have target_map_name
+            num_cg_beads = len(species)
+            cg_species = species
+            initial_mapping = tuple(range(num_cg_beads))
+            ref_map_name = target_map_name
+
+        print(f"[INFO] Using static '{target_map_name}' map: {initial_mapping}")
+        print(f"[INFO] Number of CG beads: {num_cg_beads}")
+        print(f"[INFO] Using CG species: {cg_species}")
+
+    else:
+        # Learned CG mode:
+        target_map_name = "custom" if custom_cg_array is not None else "hmerged"
+
+        if map_inst is not None:
+            if explicit_num_beads is not None:
+                # User explicitly specified number of CG beads
+                num_cg_beads = explicit_num_beads
+                # Look for a matching reference map with this bead count (if one exists)
+                if target_map_name in available_maps and len(map_inst.get_map(target_map_name)[1]) == explicit_num_beads:
+                    ref_map_name = target_map_name
+                else:
+                    for map_name in available_maps:
+                        _, s_tmp, _, _ = map_inst.get_map(map_name)
+                        if len(s_tmp) == explicit_num_beads:
+                            ref_map_name = map_name
+                            break
+            else:
+                # Derive bead count from target reference map, or fallback to 10-bead map or first available
+                if target_map_name in available_maps:
+                    ref_map_name = target_map_name
+                else:
+                    for map_name in available_maps:
+                        _, s_tmp, _, _ = map_inst.get_map(map_name)
+                        if len(s_tmp) == 10:
+                            ref_map_name = map_name
+                            break
+                    if ref_map_name is None and len(available_maps) > 0:
+                        ref_map_name = available_maps[0]
+
+        if ref_map_name is not None and map_inst is not None:
+            indices, ref_species, _, _ = map_inst.get_map(ref_map_name)
+            if num_cg_beads is None:
+                num_cg_beads = len(ref_species)
+            indices_clean = [idx if idx >= 0 else 0 for idx in indices]
+            initial_mapping = tuple(indices_clean)
+        else:
+            if num_cg_beads is None:
+                num_cg_beads = 10
+                print("[WARNING] No reference map found. Defaulting to 10 CG beads.")
+            # Partition atoms uniformly across beads for neighbor list allocation
+            n_atoms = len(masses)
+            initial_mapping = tuple(min(i * num_cg_beads // n_atoms, num_cg_beads - 1) for i in range(n_atoms))
+
+        if MACE_CONFIG.get("cg_init") != "random" and ref_map_name is None:
+            raise ValueError(
+                f"Requested cg_init='{MACE_CONFIG.get('cg_init')}' with {num_cg_beads} beads, but no matching heuristic map was found."
+            )
+
+        # Determine CG species and model species count
+        if MACE_CONFIG["learned_species_embedding"]:
+            cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
+            n_species = MACE_CONFIG.get("species_embedding_dim", 16)
+        elif MACE_CONFIG.get("unique_cg_species", False):
+            cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
+            n_species = num_cg_beads
+        else:
+            if ref_species is not None and len(ref_species) == num_cg_beads:
+                cg_species = onp.array(ref_species, dtype=onp.int32)
+            else:
+                cg_species = onp.arange(1, num_cg_beads + 1, dtype=onp.int32)
+            _, cg_species_dense = onp.unique(cg_species, return_inverse=True)
+            cg_species = (cg_species_dense + 1).astype(onp.int32)
+            n_species = len(set(cg_species.tolist()))
+
+        # Accurate log messages
+        if MACE_CONFIG.get("cg_init") == "random":
+            if cli_specified_beads and num_cg_beads != 10:
+                bead_desc = f"bead count set to {num_cg_beads}"
+            elif ref_map_name is not None:
+                bead_desc = f"bead count {num_cg_beads} derived from '{ref_map_name}' map"
+            else:
+                bead_desc = f"default bead count {num_cg_beads}"
+
+            if MACE_CONFIG["learned_species_embedding"]:
+                species_desc = f"learned species embeddings (dim={n_species})"
+            elif MACE_CONFIG.get("unique_cg_species", False):
+                species_desc = "unique species per bead (1..N)"
+            elif ref_map_name is not None:
+                species_desc = f"species derived from '{ref_map_name}' map"
+            else:
+                species_desc = "default species"
+
+            print(f"[INFO] Initializing learned CG mapping using RANDOM weights ({bead_desc}, {species_desc})")
+        else:
+            print(f"[INFO] Initializing learned CG mapping using heuristic '{ref_map_name}' map: {initial_mapping}")
+
+        print(f"[INFO] Number of CG beads: {num_cg_beads}")
+        if MACE_CONFIG["learned_species_embedding"]:
+            print(f"[INFO] MACE model initialized with learned species embedding dim={n_species}")
+        elif MACE_CONFIG.get("unique_cg_species", False):
+            print(f"[INFO] Using unique CG species: {cg_species}")
+        else:
+            print(f"[INFO] Learned CG mode: {n_species} unique species mapped to 1-based contiguous range [1..{n_species}].")
+            print(f"[INFO] Using CG species: {cg_species}")
+
+    MACE_CONFIG["cg_species"] = cg_species.tolist()
+    MACE_CONFIG["num_cg_beads"] = num_cg_beads
+
+else:
+    num_cg_beads = len(species)
+    cg_species = species
 
 if MACE_CONFIG["CG_map"] == "learned":
-    if MACE_CONFIG["learned_species_embedding"]:
-        n_species = MACE_CONFIG.get("species_embedding_dim", 16)
-        print(f"[INFO] MACE model initialized with learned species embedding dim={n_species}")
-    else:
-        # Map species to a 1-indexed contiguous range [1..n_species] for AtomicNumberMapping compatibility.
-        _, cg_species_dense = onp.unique(cg_species, return_inverse=True)
-        cg_species = (cg_species_dense + 1).astype(onp.int32)
-        n_species = len(set(cg_species.tolist()))
-        print(f"[INFO] Learned CG mode: {n_species} unique species mapped to 1-based contiguous range [1..{n_species}].")
 
     # Create mass-weighted mapping matrix for neighbor list allocation
     # Must match the static path's get_map_weights (m_i / M_I) to ensure
@@ -883,7 +1004,8 @@ def make_joint_labels(params, freeze_cg=False, learned_species_embedding=False):
     return jax.tree_util.tree_map_with_path(label_fn, params)
 
 if MACE_CONFIG["CG_map"] == "learned":
-    cg_save_freq = TRAIN_CONFIG.get("cg_save_freq", 5)
+    cg_save_freq = 1
+    TRAIN_CONFIG["cg_save_freq"] = cg_save_freq
     joint_params = {'mace': init_params, 'cg_map': cg_params['params']}
     
     cg_weight_decay = TRAIN_CONFIG.get("cg_weight_decay", 0.0)
@@ -971,18 +1093,16 @@ if MACE_CONFIG["CG_map"] == "learned":
         if cg_map_params is not None:
             epoch = trainer._epoch
 
-            # Aggregate and save CG gradients every x epochs and at the final epoch
+            # Aggregate and save CG gradients every epoch
             if hasattr(trainer, "epoch_cg_gradients") and trainer.epoch_cg_gradients:
                 if not hasattr(trainer, "saved_cg_gradients"):
                     trainer.saved_cg_gradients = {}
-                cg_save_freq = getattr(trainer, "cg_save_freq", 5)
-                if epoch % cg_save_freq == 0 or epoch == epochs - 1:
-                    avg_kernel_grad = onp.mean([g['kernel'] for g in trainer.epoch_cg_gradients], axis=0)
-                    avg_bias_grad = onp.mean([g['bias'] for g in trainer.epoch_cg_gradients], axis=0)
-                    trainer.saved_cg_gradients[int(epoch)] = {
-                        'kernel': avg_kernel_grad.tolist(),
-                        'bias': avg_bias_grad.tolist()
-                    }
+                avg_kernel_grad = onp.mean([g['kernel'] for g in trainer.epoch_cg_gradients], axis=0)
+                avg_bias_grad = onp.mean([g['bias'] for g in trainer.epoch_cg_gradients], axis=0)
+                trainer.saved_cg_gradients[int(epoch)] = {
+                    'kernel': avg_kernel_grad.tolist(),
+                    'bias': avg_bias_grad.tolist()
+                }
                 trainer.epoch_cg_gradients.clear()
 
             # Save atom embeddings if learned_species_embedding is enabled
@@ -991,18 +1111,16 @@ if MACE_CONFIG["CG_map"] == "learned":
                 if atom_type_embeddings is not None:
                     if not hasattr(trainer, "saved_atom_embeddings"):
                         trainer.saved_atom_embeddings = {}
-                    cg_save_freq = getattr(trainer, "cg_save_freq", 5)
-                    if epoch % cg_save_freq == 0 or epoch == epochs - 1:
-                        unique_species = getattr(cg_model, "unique_atom_species", None)
-                        emb_arr = jax.device_get(atom_type_embeddings)
-                        emb_dict = {}
-                        if unique_species is not None:
-                            for idx, spec in enumerate(unique_species):
-                                emb_dict[int(spec)] = emb_arr[idx].tolist()
-                        else:
-                            for idx in range(emb_arr.shape[0]):
-                                emb_dict[int(idx)] = emb_arr[idx].tolist()
-                        trainer.saved_atom_embeddings[int(epoch)] = emb_dict
+                    unique_species = getattr(cg_model, "unique_atom_species", None)
+                    emb_arr = jax.device_get(atom_type_embeddings)
+                    emb_dict = {}
+                    if unique_species is not None:
+                        for idx, spec in enumerate(unique_species):
+                            emb_dict[int(spec)] = emb_arr[idx].tolist()
+                    else:
+                        for idx in range(emb_arr.shape[0]):
+                            emb_dict[int(idx)] = emb_arr[idx].tolist()
+                    trainer.saved_atom_embeddings[int(epoch)] = emb_dict
 
             dense_keys = [k for k in cg_map_params.keys() if 'Dense' in k]
             if dense_keys:
@@ -1049,8 +1167,12 @@ if MACE_CONFIG["CG_map"] == "learned":
                     trainer.saved_cg_logits_history["final_logits"] = logits_np.tolist()
                     
                     assignments = jnp.argmax(logits, axis=-1)
-                    print(f"\n--- Learned CG Mapping at Epoch {epoch} ---")
-                    
+                    assignments_list = [int(x) for x in jax.device_get(assignments)]
+
+                    # Track final mapping
+                    trainer.final_cg_map = assignments_list
+                    trainer.final_cg_epoch = int(epoch)
+
                     epoch_steps = getattr(trainer, "epoch_cg_step_count", 0)
                     epoch_changes = getattr(trainer, "epoch_cg_map_changes", 0)
                     epoch_flips = getattr(trainer, "epoch_cg_atom_flips", 0)
@@ -1089,23 +1211,19 @@ if MACE_CONFIG["CG_map"] == "learned":
                     trainer.epoch_cg_map_changes = 0
                     trainer.epoch_cg_atom_flips = 0
 
-                    # Print kernel stats
+                    # Save CG map every epoch
+                    if not hasattr(trainer, "saved_cg_maps"):
+                        trainer.saved_cg_maps = {}
+                    trainer.saved_cg_maps[int(epoch)] = assignments_list
+
+                    print(f"\n--- Learned CG Mapping at Epoch {epoch} ---")
                     k_min, k_max, k_mean = jnp.min(kernel), jnp.max(kernel), jnp.mean(kernel)
                     print(f"[DEBUG] Mapping weights stats - Min: {k_min:.4f}, Max: {k_max:.4f}, Mean: {k_mean:.4f}")
                     print(f"[DEBUG] Pre-softmax logits stats - Min: {l_min:.4f}, Max: {l_max:.4f}, Mean: {l_mean:.4f}, Max |logit|: {max_abs_l:.4f}, Avg Margin: {avg_margin:.4f}")
                     flips_str = f" ({epoch_flips} atom flips, avg {epoch_flips / max(1, epoch_changes):.1f} flips/change)" if epoch_changes > 0 else ""
                     print(f"[DEBUG] Hard CG map changes vs prev step: {epoch_changes}/{epoch_steps} ({epoch_change_rate * 100:.2f}%) this epoch | Total: {total_changes}/{total_steps} ({total_change_rate * 100:.2f}%){flips_str}")
-                    
-                    assignments_list = [int(x) for x in jax.device_get(assignments)]
                     print(f"Atom assignments to CG beads: {assignments_list}")
-                    
-                    # Save CG map every x epochs and at the final epoch
-                    if not hasattr(trainer, "saved_cg_maps"):
-                        trainer.saved_cg_maps = {}
-                    cg_save_freq = getattr(trainer, "cg_save_freq", 5)
-                    if epoch % cg_save_freq == 0 or epoch == epochs - 1:
-                        trainer.saved_cg_maps[int(epoch)] = assignments_list
-                    
+
                     bead_to_atoms = {}
                     for atom_idx, bead_idx in enumerate(assignments_list):
                         bead_to_atoms.setdefault(bead_idx, []).append(atom_idx)
@@ -1304,6 +1422,9 @@ try:
 
     if MACE_CONFIG["CG_map"] == "learned" and hasattr(trainer_fm, "saved_cg_maps") and len(trainer_fm.saved_cg_maps) > 1:
         sorted_epochs = sorted(trainer_fm.saved_cg_maps.keys())
+        if len(sorted_epochs) > 10:
+            step = max(1, len(sorted_epochs) // 10)
+            sorted_epochs = sorted_epochs[::step][:10]
         mappings = [trainer_fm.saved_cg_maps[ep] for ep in sorted_epochs]
         legends = [f"Epoch {ep}" for ep in sorted_epochs]
 
@@ -1312,21 +1433,30 @@ try:
                 mol,
                 mappings,
                 reference_mapping=initial_mapping,
-                reference_species=cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species,
+                reference_species=ref_species if ref_species is not None else None,
+                num_beads=num_cg_beads,
             )
             print("[INFO] Dynamically derived CG species per bead based on learned atom composition.")
         else:
             epoch_species = [cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species for _ in sorted_epochs]
 
         output_image_path = f"{output_dir}/cg_maps_over_time.png"
-        visualize_mapping_grid(mol, mappings, legends, epoch_species, output_image_path)
+        visualize_mapping_grid(mol, mappings, legends, epoch_species, output_image_path, num_beads=num_cg_beads)
         print(f"[INFO] Saved CG maps visualization over time to {output_image_path}")
     else:
         # Single fixed map (static, custom, or single epoch)
-        if MACE_CONFIG["CG_map"] == "learned" and hasattr(trainer_fm, "saved_cg_maps") and trainer_fm.saved_cg_maps:
-            final_ep = max(trainer_fm.saved_cg_maps.keys())
-            map_to_plot = trainer_fm.saved_cg_maps[final_ep]
-            legend_str = f"Learned CG Map (Epoch {final_ep})"
+        if MACE_CONFIG["CG_map"] == "learned":
+            if hasattr(trainer_fm, "final_cg_map") and trainer_fm.final_cg_map is not None:
+                final_ep = getattr(trainer_fm, "final_cg_epoch", epochs - 1)
+                map_to_plot = trainer_fm.final_cg_map
+                legend_str = f"Learned CG Map (Epoch {final_ep})"
+            elif hasattr(trainer_fm, "saved_cg_maps") and trainer_fm.saved_cg_maps:
+                final_ep = max(trainer_fm.saved_cg_maps.keys())
+                map_to_plot = trainer_fm.saved_cg_maps[final_ep]
+                legend_str = f"Learned CG Map (Epoch {final_ep})"
+            else:
+                map_to_plot = list(initial_mapping) if initial_mapping is not None else []
+                legend_str = f"CG Map ({MACE_CONFIG['CG_map']})"
         else:
             map_to_plot = list(initial_mapping) if initial_mapping is not None else []
             legend_str = f"CG Map ({MACE_CONFIG['CG_map']})"
@@ -1336,14 +1466,15 @@ try:
                 mol,
                 map_to_plot,
                 reference_mapping=initial_mapping,
-                reference_species=cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species,
+                reference_species=ref_species if ref_species is not None else None,
+                num_beads=num_cg_beads,
             )
             print("[INFO] Dynamically derived CG species for single map based on learned atom composition.")
         else:
             plot_species = cg_species.tolist() if hasattr(cg_species, "tolist") else cg_species
 
         output_image_path = f"{output_dir}/cg_map.png"
-        visualize_mapping(mol, map_to_plot, output_image_path, species=plot_species, legend=legend_str)
+        visualize_mapping(mol, map_to_plot, output_image_path, species=plot_species, legend=legend_str, num_beads=num_cg_beads)
         print(f"[INFO] Saved CG map visualization to {output_image_path}")
 except Exception as e:
     print(f"[WARNING] Could not generate CG map visualization: {e}")
