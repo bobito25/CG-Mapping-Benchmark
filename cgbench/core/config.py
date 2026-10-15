@@ -88,8 +88,8 @@ DEFAULT_SIM_CONFIG = {
     "sim_mode": "sampling",  # simulation mode: 'sampling', 'stability', 'helix', 'speed'
     "ensemble": "NVT", # NVT or NVE
     "t_eq": 0,  # Equlibration time in ps
-    "t_total": 100,  # Total simulation time in ps (- t_eq)
-    "n_chains": 5, # Number of simulations (parallel)
+    "t_total": 200,  # Total simulation time in ps (- t_eq)
+    "n_chains": 50, # Number of simulations (parallel)
     "kT": 300.0 * quantity.kb,  # Temperature in energy units
     "T": 300.0,
     "PRNGKey_seed": SEED,

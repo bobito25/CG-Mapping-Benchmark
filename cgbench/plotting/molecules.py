@@ -222,7 +222,25 @@ def vis_ala2(
             "coreBetaMap2": ([0, 1, 2, 4], [1, 2, 4, 5], [(0, 1), (1, 2), (2, 4)]),
             "coreBetaSingle": ([0, 1, 2, 4], [1, 2, 4, 5], [(0, 1), (1, 2), (2, 4)]),
         }
-        phi_indices, psi_indices, pairs = maps[cg_map]
+        if cg_map in maps:
+            phi_indices, psi_indices, pairs = maps[cg_map]
+        elif (
+            hasattr(dataset, "map_obj")
+            and hasattr(dataset.map_obj, "_maps")
+            and "custom" in dataset.map_obj._maps
+        ):
+            c_indices = dataset.map_obj._maps["custom"]["indices"]
+            raw_phi = [c_indices[i] for i in [4, 6, 8, 14]]
+            raw_psi = [c_indices[i] for i in [6, 8, 14, 16]]
+            raw_pairs = [(c_indices[i], c_indices[j]) for i, j in [(4, 6), (6, 8), (8, 14)] if c_indices[i] != c_indices[j]]
+            if len(set(raw_phi)) == 4 and len(set(raw_psi)) == 4:
+                phi_indices, psi_indices = raw_phi, raw_psi
+            else:
+                phi_indices, psi_indices = None, None
+            pairs = raw_pairs
+        else:
+            phi_indices, psi_indices, pairs = None, None, []
+
         ref_coords = np.concatenate(
             [
                 dataset.cg_dataset_U["training"]["R"],
@@ -234,19 +252,23 @@ def vis_ala2(
     traj_coords, aux = load_trajectory(traj_path)
     disp_fn, _ = periodic_displacement(box, True)
 
-    ala2_dihedral_fn = init_dihedral_fn(disp_fn, [phi_indices, psi_indices])
-    AT_phi, AT_psi = ala2_dihedral_fn(ref_coords)
-    Traj_phi, Traj_psi = ala2_dihedral_fn(traj_coords)
-
-    AT_dists = [compute_atom_distance(ref_coords, i, j, disp_fn) for i, j in pairs]
-    Traj_dists = [compute_atom_distance(traj_coords, i, j, disp_fn) for i, j in pairs]
-
     plot_energy_and_kT(aux, line_locs, outpath)
-    plot_time_series(traj_coords, ref_coords, phi_indices, outpath, name, line_locs)
-    plot_dist_series(pairs, AT_dists, Traj_dists, outpath, name, line_locs)
-    plot_dihedrals(AT_phi, AT_psi, Traj_phi, Traj_psi, outpath, line_locs)
 
-    plot_ramachandran(AT_phi, AT_psi, Traj_phi, Traj_psi, 300.0 * quantity.kb, outpath)
+    if phi_indices is not None and psi_indices is not None:
+        ala2_dihedral_fn = init_dihedral_fn(disp_fn, [phi_indices, psi_indices])
+        AT_phi, AT_psi = ala2_dihedral_fn(ref_coords)
+        Traj_phi, Traj_psi = ala2_dihedral_fn(traj_coords)
+
+        plot_time_series(traj_coords, ref_coords, phi_indices, outpath, name, line_locs)
+        plot_dihedrals(AT_phi, AT_psi, Traj_phi, Traj_psi, outpath, line_locs)
+        plot_ramachandran(AT_phi, AT_psi, Traj_phi, Traj_psi, 300.0 * quantity.kb, outpath)
+    else:
+        print(f"[INFO] Skipping dihedral / Ramachandran plots for map '{cg_map}' as backbone beads are not distinct.")
+
+    if pairs:
+        AT_dists = [compute_atom_distance(ref_coords, i, j, disp_fn) for i, j in pairs]
+        Traj_dists = [compute_atom_distance(traj_coords, i, j, disp_fn) for i, j in pairs]
+        plot_dist_series(pairs, AT_dists, Traj_dists, outpath, name, line_locs)
 
 
 def vis_hexane(

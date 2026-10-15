@@ -5,20 +5,29 @@ import sys
 # Add parent directory to path to import cgbench
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+# Ensure CUDA_VISIBLE_DEVICES is set BEFORE importing JAX or cgbench (which imports JAX)
+if "--device" in sys.argv:
+    _idx = sys.argv.index("--device")
+    if _idx + 1 < len(sys.argv):
+        os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[_idx + 1]
+elif "GPU_CHOICE" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["GPU_CHOICE"]
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", type=str, help="GPU or MIG UUID")
 parser.add_argument("--model", type=str, help="Model path", required=True) # Pass path to best_params.pkl
 parser.add_argument("--mol", type=str, help="Molecule to simulate", required=True)
+parser.add_argument("--t-total", type=float, help="Total simulation time in ps", default=None)
+parser.add_argument("--n-chains", type=int, help="Number of parallel chains", default=None)
+parser.add_argument("--sim-mode", type=str, help="Simulation mode ('sampling', 'stability', 'speed', etc.)", default=None)
+parser.add_argument("--dt-fs", type=float, nargs="+", help="Timestep(s) in fs to simulate", default=None)
+parser.add_argument("--ensemble", type=str, choices=["NVT", "NVE"], help="Ensemble (NVT or NVE)", default=None)
 parser.add_argument(
     "--verbose", action="store_true", help="Enable verbose output", default=True
 )
 args = parser.parse_args()
-
-# Set device
-if args.device:
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
-
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
 
 import json
 import pickle
@@ -61,10 +70,66 @@ if os.path.exists(train_config_path):
 else:
     raise FileNotFoundError(f"Train config file {train_config_path} not found.")
 
+# -------------------------
+# Load model checkpoint
+# -------------------------
+if not os.path.exists(model_path):
+    raise FileNotFoundError(f"Model file {model_path} not found.")
+
+energy_params_raw = onp.load(model_path, allow_pickle=True)
+energy_params_raw = tree_util.tree_map(jnp.asarray, energy_params_raw)
+
+if isinstance(energy_params_raw, dict) and "mace" in energy_params_raw:
+    energy_params = energy_params_raw["mace"]
+    cg_params = energy_params_raw.get("cg_map", None)
+else:
+    energy_params = energy_params_raw
+    cg_params = None
+
+is_learned = (MACE_CONFIG.get("CG_map") == "learned")
+learned_map = None
+
+if is_learned:
+    # 1. Prioritize extracting the mapping directly from checkpoint weights to ensure
+    # exact consistency with best_params.pkl / final_params.pkl
+    if cg_params is not None:
+        dense_keys = [k for k in cg_params.keys() if "Dense" in k]
+        if dense_keys:
+            dense = cg_params[dense_keys[0]]
+            k = dense.get("kernel")
+            b = dense.get("bias", 0.0)
+            logits = (k + b[None, :]) if b is not None else k
+            learned_map = [int(x) for x in onp.asarray(jnp.argmax(logits, axis=-1))]
+            print(f"[INFO] Extracted learned CG map from checkpoint weights: {learned_map}")
+
+    # 2. Fall back to cg_maps.json if not found in checkpoint weights
+    if learned_map is None:
+        cg_maps_path = os.path.join(base_dir, "cg_maps.json")
+        if os.path.exists(cg_maps_path):
+            with open(cg_maps_path, "r") as f:
+                cg_maps_dict = json.load(f)
+            last_epoch = max(cg_maps_dict.keys(), key=int)
+            learned_map = cg_maps_dict[last_epoch]
+            print(f"[INFO] Loaded learned CG map from {cg_maps_path} (epoch {last_epoch}): {learned_map}")
+
+    if learned_map is None:
+        raise ValueError(f"Could not determine learned CG mapping from {base_dir}")
+
 config = SIM_CONFIG.copy()
 config["sim_mol"] = args.mol
 config["type"] = MACE_CONFIG["type"]
 config["cg_map"] = MACE_CONFIG.get("CG_map", None)
+
+if args.t_total is not None:
+    config["t_total"] = args.t_total
+if args.n_chains is not None:
+    config["n_chains"] = args.n_chains
+if args.sim_mode is not None:
+    config["sim_mode"] = args.sim_mode
+if args.dt_fs is not None:
+    config["dt_values_fs"] = args.dt_fs
+if args.ensemble is not None:
+    config["ensemble"] = args.ensemble
 
 if args.verbose:
     print("-" * 50)
@@ -121,15 +186,86 @@ if MACE_CONFIG["type"] == "AT":
     species = data.species
     masses = data.masses
     n_species = data.n_species
+    num_cg_beads = len(species)
 # CG
 elif MACE_CONFIG["type"] == "CG":
-    data.coarse_grain(map=MACE_CONFIG["CG_map"])
-    dataset = data.cg_dataset_U
-    species = data.cg_species
-    masses = data.cg_masses
-    n_species = data.n_cg_species
+    if is_learned:
+        from cgbench.core.mapping import register_custom_map
+        register_custom_map(data.map_obj, learned_map)
+        data.coarse_grain(map="custom")
+        dataset = data.cg_dataset_U
+        masses = data.cg_masses
+        num_cg_beads = data.n_cg_sites
+    else:
+        data.coarse_grain(map=MACE_CONFIG["CG_map"])
+        dataset = data.cg_dataset_U
+        species = data.cg_species
+        masses = data.cg_masses
+        n_species = data.n_cg_species
+        num_cg_beads = len(species)
 else:
     raise ValueError("Invalid simulation type. Use 'AT' or 'CG'.")
+
+# -------------------------
+# Species resolution
+# -------------------------
+if MACE_CONFIG["type"] == "CG" and is_learned:
+    if MACE_CONFIG.get("learned_species_embedding", False):
+        dim = MACE_CONFIG.get("species_embedding_dim", 16)
+        n_species = dim
+
+        if cg_params is not None and "atom_type_embeddings" in cg_params:
+            atom_type_embeddings = jnp.asarray(cg_params["atom_type_embeddings"])
+        else:
+            atom_emb_path = os.path.join(base_dir, "atom_embeddings.json")
+            if os.path.exists(atom_emb_path):
+                with open(atom_emb_path, "r") as f:
+                    saved_atom_emb = json.load(f)
+                last_ep = max(saved_atom_emb.keys(), key=int)
+                emb_dict = saved_atom_emb[last_ep]
+                atom_type_embeddings = jnp.asarray([emb_dict[str(k)] for k in sorted([int(x) for x in emb_dict.keys()])])
+                print(f"[INFO] Loaded atom type embeddings from {atom_emb_path} (epoch {last_ep})")
+            else:
+                raise ValueError(f"Could not find atom_type_embeddings in checkpoint or {atom_emb_path}")
+
+        if MACE_CONFIG.get("normalize_atom_embedding", False):
+            norm = jnp.linalg.norm(atom_type_embeddings, axis=-1, keepdims=True)
+            atom_type_embeddings = atom_type_embeddings / (norm + 1e-8)
+
+        # Count atom types per bead
+        atom_species_all = data.dataset_U["training"]["species"][0]
+        unique_atom_species = jnp.array(sorted(list(set(atom_species_all.tolist()))))
+        num_atom_types = unique_atom_species.shape[0]
+        atom_type_indices = jnp.argmax(atom_species_all[:, None] == unique_atom_species[None, :], axis=-1)
+        one_hot_atom_types = jax.nn.one_hot(atom_type_indices, num_atom_types)
+
+        assign_one_hot = jax.nn.one_hot(jnp.asarray(learned_map), num_cg_beads)
+        assign_t = assign_one_hot.T
+        bead_atom_types = jnp.matmul(assign_t, one_hot_atom_types)
+
+        species_init = jnp.matmul(bead_atom_types, atom_type_embeddings)
+        print(f"[INFO] Initialized learned species features: shape {species_init.shape}, dim {dim}")
+
+    elif MACE_CONFIG.get("unique_cg_species", False):
+        n_species = num_cg_beads
+        species_init = jnp.arange(1, num_cg_beads + 1, dtype=jnp.int32)
+        print(f"[INFO] Using unique CG species IDs: 1..{num_cg_beads}")
+
+    else:
+        cg_species_saved = MACE_CONFIG.get("cg_species", data.cg_species)
+        _, species_dense = onp.unique(cg_species_saved, return_inverse=True)
+        species_init = jnp.asarray(species_dense + 1, dtype=jnp.int32)
+        n_species = len(set(species_init.tolist()))
+        print(f"[INFO] Using categorical CG species: {n_species} unique classes")
+
+elif MACE_CONFIG["type"] == "CG":
+    _, species_dense = onp.unique(species, return_inverse=True)
+    species_init = jnp.asarray(species_dense + 1, dtype=jnp.int32)
+    n_species = len(set(species_init.tolist()))
+else:
+    _, species_dense = onp.unique(species, return_inverse=True)
+    species_init = jnp.asarray(species_dense + 1, dtype=jnp.int32)
+    n_species = len(set(species_init.tolist()))
 
 # -------------------------
 # Neighbor list setup
@@ -157,6 +293,7 @@ nbrs_init, (max_neighbors, max_edges, avg_num_neighbors) = (
 # Model initialization
 # -------------------------
 mace_cfg = {
+    "atomic_numbers": onp.arange(1, n_species + 1, dtype=onp.int32),
     "r_cutoff": MACE_CONFIG["r_cutoff"],
     "hidden_irreps": MACE_CONFIG["hidden_irreps"],
     "MLP_irreps": MACE_CONFIG["readout_mlp_irreps"],
@@ -192,30 +329,9 @@ template_vars, gnn_energy_fn, model_config = mace_jax_compose.mace_jax_neighborl
 )
 
 variables = template_vars
-species_init = jnp.asarray(species)
 
 if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
     print("Using bond priors in simulation energy function.")
-
-    
-# key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
-# #assert key in BOND_SPRING_CONSTANTS
-# prior_constants = BOND_SPRING_CONSTANTS[key]
-
-# harmonic_energy_fn = energy.simple_spring_bond(
-#             displacement_fn, 
-#             bond=jnp.asarray(prior_constants['indices']),
-#             length=jnp.exp(prior_constants['log_b0']), # b0
-#             epsilon=jnp.exp(prior_constants['log_kb']), # kb
-#             alpha=2.0 # standard harmonic
-#         )
-
-# def prior_energy_wrapper(energy_fn_template):
-#     def prior_energy(state, neighbor, energy_params, **kwargs):
-#         energy_fn = energy_fn_template(energy_params)
-#         harmonic_energy = energy_fn(state.position)
-#         return harmonic_energy
-#     return prior_energy
 
 def energy_fn_template(energy_params):
     vars = {**variables}
@@ -231,45 +347,48 @@ def energy_fn_template(energy_params):
         if pots.ndim == 2 and pots.shape[-1] == 1:
             pots = pots.squeeze(-1)
 
-        atomic_numbers = jnp.asarray(model_config["atomic_numbers"], dtype=jnp.int32)
-        atomic_energies = jnp.asarray(model_config["atomic_energies"], dtype=jnp.float32)
-        mapped_species = jnp.argmax(dynamic_kwargs["species"][:, None] == atomic_numbers[None, :], axis=-1)
+        if jnp.issubdtype(dynamic_kwargs["species"].dtype, jnp.floating):
+            pots = pots * mask
+        else:
+            atomic_numbers = jnp.asarray(model_config["atomic_numbers"], dtype=jnp.int32)
+            atomic_energies = jnp.asarray(model_config["atomic_energies"], dtype=jnp.float32)
+            mapped_species = jnp.argmax(dynamic_kwargs["species"][:, None] == atomic_numbers[None, :], axis=-1)
+            pots = (pots - atomic_energies[mapped_species]) * mask
 
-        pots = (pots - atomic_energies[mapped_species]) * mask
         return jnp.sum(pots)
     
-    if 'use_bond_priors' in MACE_CONFIG and MACE_CONFIG['use_bond_priors']:
-        # Hexane, two-site
-        harmonic_energy_fn = energy.simple_spring_bond(
-            displacement_fn, 
-            bond=jnp.asarray(prior_constants['indices']),
-            length=jnp.exp(prior_constants['log_b0']), # b0
-            epsilon=jnp.exp(prior_constants['log_kb']), # kb
-            alpha=2.0 # standard harmonic
-        )
-        
-        def total_energy_fn(pos, neighbor, **dynamic_kwargs):
-            gnn_e = energy_fn(pos, neighbor, **dynamic_kwargs)
-            harmonic_e = harmonic_energy_fn(pos)
-            return gnn_e + harmonic_e
+    if MACE_CONFIG.get("use_bond_priors", False):
+        key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
+        if key not in BOND_SPRING_CONSTANTS:
+            fallback_key = f"mol={MACE_CONFIG['mol']}_map=hmerged"
+            if fallback_key in BOND_SPRING_CONSTANTS:
+                key = fallback_key
+                print(f"[WARNING] Prior constants for '{MACE_CONFIG['CG_map']}' not found. Falling back to '{fallback_key}'.")
+        if key in BOND_SPRING_CONSTANTS:
+            prior_constants = BOND_SPRING_CONSTANTS[key]
+            harmonic_energy_fn = energy.simple_spring_bond(
+                displacement_fn, 
+                bond=jnp.asarray(prior_constants['indices']),
+                length=jnp.exp(prior_constants['log_b0']), # b0
+                epsilon=jnp.exp(prior_constants['log_kb']), # kb
+                alpha=2.0 # standard harmonic
+            )
             
-        return total_energy_fn
-        
+            def total_energy_fn(pos, neighbor, **dynamic_kwargs):
+                gnn_e = energy_fn(pos, neighbor, **dynamic_kwargs)
+                harmonic_e = harmonic_energy_fn(pos)
+                return gnn_e + harmonic_e
+                
+            return total_energy_fn
+        else:
+            print(f"[WARNING] No prior constants found for key '{key}'. Proceeding without bond priors.")
+            return energy_fn
     else:
         return energy_fn
 
 if args.verbose:
     print(f"Max neighbors: {max_neighbors}, max edges: {max_edges}")
 
-# -------------------------
-# Load model parameters
-# -------------------------
-model_path = args.model
-base_dir = os.path.dirname(model_path)
-if not os.path.exists(model_path):
-    raise FileNotFoundError(f"Model file {model_path} not found.")
-energy_params = onp.load(model_path, allow_pickle=True)
-energy_params = tree_util.tree_map(jnp.asarray, energy_params)
 energy_fn = energy_fn_template(energy_params)
 
 # Setup base dir
