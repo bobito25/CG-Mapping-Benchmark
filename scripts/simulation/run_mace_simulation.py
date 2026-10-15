@@ -25,10 +25,30 @@ parser.add_argument("--sim-mode", type=str, help="Simulation mode ('sampling', '
 parser.add_argument("--dt-fs", type=float, nargs="+", help="Timestep(s) in fs to simulate", default=None)
 parser.add_argument("--ensemble", type=str, choices=["NVT", "NVE"], help="Ensemble (NVT or NVE)", default=None)
 parser.add_argument(
+    "--cg-map", "--cgmap",
+    dest="cg_map",
+    type=str,
+    help="Manual CG mapping to use (e.g. 'hmerged', 'c-alpha', or a list string like '[0,0,1,1]')",
+    default=None,
+)
+parser.add_argument(
+    "--custom-cg-map",
+    type=str,
+    help="Custom CG mapping as list of bead indices per atom, e.g. '[0,0,1,1]'",
+    default=None,
+)
+parser.add_argument(
+    "--map-name",
+    type=str,
+    help="Optional name/tag for the manual CG map (used in output directory name, e.g. 'co_merged')",
+    default=None,
+)
+parser.add_argument(
     "--verbose", action="store_true", help="Enable verbose output", default=True
 )
 args = parser.parse_args()
 
+import ast
 import json
 import pickle
 import numpy as onp
@@ -53,6 +73,45 @@ from cgbench.core.config import DEFAULT_SIM_CONFIG as SIM_CONFIG, BOND_SPRING_CO
 model_path = args.model
 base_dir = os.path.dirname(model_path)
 
+# Parse manual CG map specification if provided
+manual_cg_choice = args.cg_map
+custom_cg_array = None
+
+if args.custom_cg_map is not None:
+    custom_cg_str = args.custom_cg_map.strip()
+    try:
+        custom_cg_array = ast.literal_eval(custom_cg_str)
+        if not isinstance(custom_cg_array, (list, tuple)):
+            raise ValueError("Custom CG map must be a list or tuple of integers.")
+        custom_cg_array = [int(x) for x in custom_cg_array]
+    except Exception as e:
+        raise ValueError(f"Failed to parse --custom-cg-map string '{args.custom_cg_map}': {e}")
+    manual_cg_choice = "custom"
+elif manual_cg_choice is not None and manual_cg_choice.strip().startswith("["):
+    custom_cg_str = manual_cg_choice.strip()
+    try:
+        custom_cg_array = ast.literal_eval(custom_cg_str)
+        if not isinstance(custom_cg_array, (list, tuple)):
+            raise ValueError("Custom CG map must be a list or tuple of integers.")
+        custom_cg_array = [int(x) for x in custom_cg_array]
+    except Exception as e:
+        raise ValueError(f"Failed to parse --cg-map array string '{manual_cg_choice}': {e}")
+    manual_cg_choice = "custom"
+
+# Assign unique map tag to avoid directory collisions between different custom maps
+if custom_cg_array is not None:
+    valid_indices = [idx for idx in custom_cg_array if idx >= 0]
+    n_beads = max(valid_indices) + 1 if valid_indices else 0
+    if args.map_name:
+        map_tag = args.map_name.strip()
+    else:
+        import hashlib
+        map_hash = hashlib.md5(str(custom_cg_array).encode()).hexdigest()[:6]
+        map_tag = f"custom_{n_beads}beads_{map_hash}"
+    manual_cg_choice = map_tag
+elif args.map_name and manual_cg_choice is not None:
+    manual_cg_choice = args.map_name.strip()
+
 # Load MACE config
 mace_config_path = os.path.join(base_dir, "config.json")
 if os.path.exists(mace_config_path):
@@ -69,6 +128,12 @@ if os.path.exists(train_config_path):
         TRAIN_CONFIG = json.load(f)
 else:
     raise FileNotFoundError(f"Train config file {train_config_path} not found.")
+
+if manual_cg_choice is not None and not MACE_CONFIG.get("learned_species_embedding", False):
+    raise NotImplementedError(
+        f"Simulating with a manual CG map ('{manual_cg_choice}') is only supported for models trained "
+        f"with learned species embeddings composed of learned atom embeddings (learned_species_embedding=True)."
+    )
 
 # -------------------------
 # Load model checkpoint
@@ -112,13 +177,16 @@ if is_learned:
             learned_map = cg_maps_dict[last_epoch]
             print(f"[INFO] Loaded learned CG map from {cg_maps_path} (epoch {last_epoch}): {learned_map}")
 
-    if learned_map is None:
+    if learned_map is None and manual_cg_choice is None:
         raise ValueError(f"Could not determine learned CG mapping from {base_dir}")
 
 config = SIM_CONFIG.copy()
 config["sim_mol"] = args.mol
 config["type"] = MACE_CONFIG["type"]
-config["cg_map"] = MACE_CONFIG.get("CG_map", None)
+if manual_cg_choice is not None:
+    config["cg_map"] = manual_cg_choice
+else:
+    config["cg_map"] = MACE_CONFIG.get("CG_map", None)
 
 if args.t_total is not None:
     config["t_total"] = args.t_total
@@ -187,15 +255,36 @@ if MACE_CONFIG["type"] == "AT":
     masses = data.masses
     n_species = data.n_species
     num_cg_beads = len(species)
+    map_indices = None
 # CG
 elif MACE_CONFIG["type"] == "CG":
-    if is_learned:
-        from cgbench.core.mapping import register_custom_map
+    from cgbench.core.mapping import register_custom_map
+    if manual_cg_choice is not None:
+        if custom_cg_array is not None:
+            register_custom_map(data.map_obj, custom_cg_array)
+            if manual_cg_choice != "custom":
+                data.map_obj._maps[manual_cg_choice] = data.map_obj._maps["custom"]
+            data.coarse_grain(map="custom")
+            dataset = data.cg_dataset_U
+            masses = data.cg_masses
+            num_cg_beads = data.n_cg_sites
+            map_indices = custom_cg_array
+            print(f"[INFO] Coarse-grained using manual custom map '{manual_cg_choice}': {map_indices} ({num_cg_beads} beads)")
+        else:
+            data.coarse_grain(map=manual_cg_choice)
+            dataset = data.cg_dataset_U
+            masses = data.cg_masses
+            num_cg_beads = data.n_cg_sites
+            map_indices, _, _, _ = data.map_obj.get_map(manual_cg_choice)
+            print(f"[INFO] Coarse-grained using manual map '{manual_cg_choice}': {map_indices} ({num_cg_beads} beads)")
+    elif is_learned:
         register_custom_map(data.map_obj, learned_map)
         data.coarse_grain(map="custom")
         dataset = data.cg_dataset_U
         masses = data.cg_masses
         num_cg_beads = data.n_cg_sites
+        map_indices = learned_map
+        print(f"[INFO] Coarse-grained using learned map: {map_indices} ({num_cg_beads} beads)")
     else:
         data.coarse_grain(map=MACE_CONFIG["CG_map"])
         dataset = data.cg_dataset_U
@@ -203,13 +292,14 @@ elif MACE_CONFIG["type"] == "CG":
         masses = data.cg_masses
         n_species = data.n_cg_species
         num_cg_beads = len(species)
+        map_indices = None
 else:
     raise ValueError("Invalid simulation type. Use 'AT' or 'CG'.")
 
 # -------------------------
 # Species resolution
 # -------------------------
-if MACE_CONFIG["type"] == "CG" and is_learned:
+if MACE_CONFIG["type"] == "CG" and (is_learned or manual_cg_choice is not None):
     if MACE_CONFIG.get("learned_species_embedding", False):
         dim = MACE_CONFIG.get("species_embedding_dim", 16)
         n_species = dim
@@ -239,12 +329,21 @@ if MACE_CONFIG["type"] == "CG" and is_learned:
         atom_type_indices = jnp.argmax(atom_species_all[:, None] == unique_atom_species[None, :], axis=-1)
         one_hot_atom_types = jax.nn.one_hot(atom_type_indices, num_atom_types)
 
-        assign_one_hot = jax.nn.one_hot(jnp.asarray(learned_map), num_cg_beads)
+        map_arr = jnp.asarray(map_indices, dtype=jnp.int32)
+        valid = map_arr >= 0
+        clipped = jnp.where(valid, map_arr, 0)
+        assign_one_hot = jax.nn.one_hot(clipped, num_cg_beads, dtype=jnp.float32) * valid[:, None]
         assign_t = assign_one_hot.T
         bead_atom_types = jnp.matmul(assign_t, one_hot_atom_types)
 
         species_init = jnp.matmul(bead_atom_types, atom_type_embeddings)
-        print(f"[INFO] Initialized learned species features: shape {species_init.shape}, dim {dim}")
+        print(f"[INFO] Initialized species features from learned atom embeddings: shape {species_init.shape}, dim {dim}")
+
+    elif manual_cg_choice is not None:
+        raise NotImplementedError(
+            f"Simulating with a manual CG map ('{manual_cg_choice}') is only supported for models trained "
+            f"with learned species embeddings composed of learned atom embeddings (learned_species_embedding=True)."
+        )
 
     elif MACE_CONFIG.get("unique_cg_species", False):
         n_species = num_cg_beads
@@ -358,12 +457,13 @@ def energy_fn_template(energy_params):
         return jnp.sum(pots)
     
     if MACE_CONFIG.get("use_bond_priors", False):
-        key = f"mol={MACE_CONFIG['mol']}_map={MACE_CONFIG['CG_map']}"
+        sim_map_name = config["cg_map"]
+        key = f"mol={MACE_CONFIG['mol']}_map={sim_map_name}"
         if key not in BOND_SPRING_CONSTANTS:
             fallback_key = f"mol={MACE_CONFIG['mol']}_map=hmerged"
             if fallback_key in BOND_SPRING_CONSTANTS:
                 key = fallback_key
-                print(f"[WARNING] Prior constants for '{MACE_CONFIG['CG_map']}' not found. Falling back to '{fallback_key}'.")
+                print(f"[WARNING] Prior constants for '{sim_map_name}' not found. Falling back to '{fallback_key}'.")
         if key in BOND_SPRING_CONSTANTS:
             prior_constants = BOND_SPRING_CONSTANTS[key]
             harmonic_energy_fn = energy.simple_spring_bond(
@@ -392,7 +492,10 @@ if args.verbose:
 energy_fn = energy_fn_template(energy_params)
 
 # Setup base dir
-outdir = f"{base_dir}/simulation_{config['ensemble']}_T={config['T']}K/"
+if manual_cg_choice is not None:
+    outdir = f"{base_dir}/simulation_{config['ensemble']}_T={config['T']}K_map={config['cg_map']}/"
+else:
+    outdir = f"{base_dir}/simulation_{config['ensemble']}_T={config['T']}K/"
 os.makedirs(outdir, exist_ok=True)
 
 # -------------------------
@@ -516,7 +619,7 @@ def visualise(traj_path, dataset):
 
     if config['sim_mol'] in vis_fn_map:
         vis_fn = vis_fn_map[config['sim_mol']]
-        vis_fn(traj_path,config,type=MACE_CONFIG['type'],dataset=dataset, cg_map=MACE_CONFIG['CG_map'])
+        vis_fn(traj_path, config, type=MACE_CONFIG['type'], dataset=dataset, cg_map=config['cg_map'])
     else:
         raise ValueError("Invalid molecule. Use 'ala2', 'hexane', 'ala15', 'pro2', 'thr2', or 'gly2'.")
 
@@ -576,6 +679,8 @@ for dt_fs, dt_ps in zip(dt_values_fs, dt_values_ps):
     config_ = config.copy()
     config_["dt"] = dt_ps
     config_.pop("dt_values_fs", None)
+    if custom_cg_array is not None:
+        config_["custom_cg_indices"] = custom_cg_array
 
     # Save config used
     with open(os.path.join(save_dir, "traj_config.json"), "w") as cf:
